@@ -1,86 +1,211 @@
+"""Gift-card incident-response training lab.
+
+A self-contained, harmless simulation of the *observable traces* left by a
+"gift card scam" malware infection, built so defenders can practise detecting
+them (Sysmon, EDR, Procmon, loopback packet capture, etc.).
+
+Nothing here is malicious:
+  * All network traffic stays on the loopback interface (127.0.0.1); the
+    server refuses to bind to any other address.
+  * The "download" is a plain text file whose contents say it is simulated.
+  * The "keylogger" never reads the keyboard -- it writes three fixed,
+    clearly-labelled TEST_* events.
+  * Every step appends a JSON line to ``events.jsonl`` in the lab directory,
+    which acts as an answer key for the exercise.
+
+Modes:
+  serve   Run the local-only HTTP server (the "attacker" host).
+  run     Play out the victim opening the lure and the payload running.
+          Add --announce for a loud "TRAINING SIMULATION" banner, and
+          --auto-serve to start the loopback server in-process (one click).
+  child   Internal: the child process spawned by ``run`` (not run directly).
+  report  Print a timeline and IOC summary from the recorded events.
+  detect  Print blue-team hunting guidance for the technique this lab imitates
+          (masquerading / lures) -- indicators plus Sysmon and KQL queries.
+  reset   Delete the lab directory so the exercise can be repeated cleanly.
+"""
+
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-LAB = Path.home() / "gift_card_ir_lab"
-PORT = 8765
+DEFAULT_LAB = Path.home() / "gift_card_ir_lab"
+DEFAULT_PORT = 8765
+HOST = "127.0.0.1"  # loopback only; see assert_loopback()
+MAX_BODY_BYTES = 1 * 1024 * 1024  # reject oversized telemetry posts
+RUN_ID_ENV = "GIFT_CARD_LAB_RUN_ID"
+LAB_DIR_ENV = "GIFT_CARD_LAB_DIR"
+PORT_ENV = "GIFT_CARD_LAB_PORT"
 
 
-def timestamp():
+def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def write_event(event, **details):
-    LAB.mkdir(exist_ok=True)
-    record = {"time_utc": timestamp(), "event": event, "pid": os.getpid(), **details}
+def assert_loopback(host: str) -> None:
+    """Guarantee the lab only ever talks to itself."""
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise SystemExit(
+            f"refusing to use non-loopback host {host!r}; this lab is "
+            "loopback-only by design"
+        )
 
-    with (LAB / "events.jsonl").open("a", encoding="utf-8") as log:
+
+BANNER = r"""
++--------------------------------------------------------------+
+|                                                              |
+|            *** TRAINING SIMULATION -- SAFE ***               |
+|                                                              |
+|   This is the Gift-Card IR detection lab. It is NOT malware. |
+|   It only talks to 127.0.0.1, writes clearly-labelled dummy  |
+|   files, and logs every step to events.jsonl as an answer    |
+|   key. Nothing leaves this machine. Nothing is disguised.    |
+|                                                              |
+|   Run `python gift_card_lab.py detect` to see what a         |
+|   defender should hunt for.                                  |
+|                                                              |
++--------------------------------------------------------------+
+"""
+
+
+def announce(gui: bool = False) -> None:
+    """Show an unmistakable 'this is a simulation' notice before running."""
+    print(BANNER)
+    if gui:
+        # Best-effort popup for classroom demos; never fatal if unavailable.
+        try:
+            import tkinter
+            from tkinter import messagebox
+
+            root = tkinter.Tk()
+            root.withdraw()
+            messagebox.showinfo(
+                "Training Simulation -- SAFE",
+                "Gift-Card IR detection lab.\n\n"
+                "This is a SAFE training simulation, not malware. It stays on "
+                "127.0.0.1 and writes only clearly-labelled dummy files.",
+            )
+            root.destroy()
+        except Exception as exc:  # tkinter missing / headless / display error
+            print(f"(gui banner unavailable: {exc})")
+
+
+def write_event(lab: Path, run_id: str, event: str, **details) -> dict:
+    lab.mkdir(exist_ok=True)
+    record = {
+        "time_utc": timestamp(),
+        "run_id": run_id,
+        "event": event,
+        "pid": os.getpid(),
+        **details,
+    }
+    with (lab / "events.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
-
     print(json.dumps(record))
+    return record
 
 
-def sha256(path):
+def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-class LabHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/gift-card":
-            self.send_error(404)
-            return
+def make_handler(lab: Path, run_id: str):
+    class LabHandler(BaseHTTPRequestHandler):
+        server_version = "GiftCardLab/2.0"
 
-        content = (
-            b"Gift card investigation lab\n"
-            b"This is a harmless simulated download.\n"
+        def do_GET(self):  # noqa: N802 (http.server API)
+            if self.path != "/gift-card":
+                self.send_error(404)
+                return
+
+            content = (
+                b"Gift card investigation lab\n"
+                b"This is a harmless simulated download.\n"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header(
+                "Content-Disposition", 'attachment; filename="gift_card.txt"'
+            )
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            write_event(
+                lab, run_id, "gift_card_download_served", client=self.client_address[0]
+            )
+
+        def do_POST(self):  # noqa: N802 (http.server API)
+            if self.path != "/lab-telemetry":
+                self.send_error(404)
+                return
+
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_error(400, "invalid Content-Length")
+                return
+            if size < 0 or size > MAX_BODY_BYTES:
+                self.send_error(413, "telemetry body too large")
+                return
+
+            body = self.rfile.read(size)
+
+            # The receiver stores only dummy lab data. Timestamp the filename
+            # so repeated runs do not silently overwrite earlier captures.
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+            out = lab / f"received_telemetry_{stamp}.json"
+            out.write_bytes(body)
+            write_event(
+                lab,
+                run_id,
+                "dummy_telemetry_received",
+                bytes_received=len(body),
+                path=str(out),
+            )
+
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, format_string, *args):
+            pass
+
+    return LabHandler
+
+
+def serve(lab: Path, port: int, run_id: str) -> None:
+    assert_loopback(HOST)
+    lab.mkdir(exist_ok=True)
+    try:
+        server = ThreadingHTTPServer((HOST, port), make_handler(lab, run_id))
+    except OSError as exc:
+        raise SystemExit(
+            f"could not bind {HOST}:{port} ({exc}); try a different --port"
         )
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Disposition", 'attachment; filename="gift_card.txt"')
-        self.send_header("Content-Length", str(len(content)))
-        self.end_headers()
-        self.wfile.write(content)
-        write_event("gift_card_download_served", client=self.client_address[0])
-
-    def do_POST(self):
-        if self.path != "/lab-telemetry":
-            self.send_error(404)
-            return
-
-        size = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(size)
-
-        # The receiver stores only dummy lab data.
-        (LAB / "received_telemetry.json").write_bytes(body)
-        write_event("dummy_telemetry_received", bytes_received=len(body))
-
-        self.send_response(204)
-        self.end_headers()
-
-    def log_message(self, format_string, *args):
-        pass
-
-
-def serve():
-    LAB.mkdir(exist_ok=True)
-    server = HTTPServer(("127.0.0.1", PORT), LabHandler)
-    write_event("local_server_started", address=f"127.0.0.1:{PORT}")
+    write_event(lab, run_id, "local_server_started", address=f"{HOST}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
         server.server_close()
 
 
-def child():
-    write_event("child_process_started", parent_pid=os.getppid())
+def child(lab: Path, port: int, run_id: str) -> None:
+    assert_loopback(HOST)
+    write_event(lab, run_id, "child_process_started", parent_pid=os.getppid())
 
     # These are fixed test events, not keyboard input.
     dummy_events = [
@@ -88,51 +213,296 @@ def child():
         {"time_utc": timestamp(), "event": "TEST_KEY_B"},
         {"time_utc": timestamp(), "event": "TEST_ENTER"},
     ]
-    output = LAB / "dummy_input_events.json"
+    output = lab / "dummy_input_events.json"
     output.write_text(json.dumps(dummy_events, indent=2), encoding="utf-8")
-    write_event("dummy_event_file_created", path=str(output))
+    write_event(lab, run_id, "dummy_event_file_created", path=str(output))
 
     request = Request(
-        f"http://127.0.0.1:{PORT}/lab-telemetry",
+        f"http://{HOST}:{port}/lab-telemetry",
         data=output.read_bytes(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=5) as response:
-        write_event("loopback_request_sent", http_status=response.status)
+    try:
+        with urlopen(request, timeout=5) as response:
+            write_event(lab, run_id, "loopback_request_sent", http_status=response.status)
+    except URLError as exc:
+        raise SystemExit(
+            f"could not reach the lab server on {HOST}:{port} ({exc.reason}); "
+            "start it first with `serve`"
+        )
 
     time.sleep(3)  # Briefly leaves the child visible in process listings.
 
 
-def run():
-    LAB.mkdir(exist_ok=True)
-    write_event("gift_card_lure_opened", scenario="training simulation")
+def _start_background_server(lab: Path, port: int, run_id: str):
+    """Start the loopback server in a daemon thread for one-click runs."""
+    import threading
 
-    url = f"http://127.0.0.1:{PORT}/gift-card"
-    with urlopen(url, timeout=5) as response:
-        downloaded = response.read()
+    server = ThreadingHTTPServer((HOST, port), make_handler(lab, run_id))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    write_event(lab, run_id, "local_server_started", address=f"{HOST}:{port}")
+    return server
 
-    file_path = LAB / "gift_card.txt"
+
+def run(
+    lab: Path,
+    port: int,
+    run_id: str,
+    show_banner: bool = False,
+    gui_banner: bool = False,
+    auto_serve: bool = False,
+) -> None:
+    assert_loopback(HOST)
+    if show_banner:
+        announce(gui=gui_banner)
+    lab.mkdir(exist_ok=True)
+
+    server = None
+    if auto_serve:
+        server = _start_background_server(lab, port, run_id)
+
+    write_event(lab, run_id, "gift_card_lure_opened", scenario="training simulation")
+
+    url = f"http://{HOST}:{port}/gift-card"
+    try:
+        with urlopen(url, timeout=5) as response:
+            downloaded = response.read()
+    except URLError as exc:
+        raise SystemExit(
+            f"could not reach the lab server on {HOST}:{port} ({exc.reason}); "
+            "start it first with `serve`"
+        )
+
+    file_path = lab / "gift_card.txt"
     file_path.write_bytes(downloaded)
     write_event(
+        lab,
+        run_id,
         "gift_card_file_downloaded",
         path=str(file_path),
         sha256=sha256(file_path),
     )
 
-    write_event("child_process_launch_requested")
-    subprocess.run([sys.executable, str(Path(__file__).resolve()), "child"], check=True)
-    write_event("simulation_completed")
+    write_event(lab, run_id, "child_process_launch_requested")
+    env = dict(os.environ, **{RUN_ID_ENV: run_id, LAB_DIR_ENV: str(lab), PORT_ENV: str(port)})
+    subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "child", "--port", str(port)],
+        check=True,
+        env=env,
+    )
+    write_event(lab, run_id, "simulation_completed")
+    if server is not None:
+        server.shutdown()
+        server.server_close()
+
+
+def load_events(lab: Path) -> list[dict]:
+    path = lab / "events.jsonl"
+    if not path.exists():
+        return []
+    events = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            events.append(json.loads(line))
+    return events
+
+
+def report(lab: Path) -> None:
+    events = load_events(lab)
+    if not events:
+        print(f"no events recorded in {lab}")
+        return
+
+    print(f"Timeline ({len(events)} events from {lab / 'events.jsonl'}):\n")
+    for e in events:
+        run_tag = (e.get("run_id") or "")[:8]
+        print(f"  {e['time_utc']}  [{run_tag}] pid={e.get('pid'):<7} {e['event']}")
+
+    hashes = {e["sha256"] for e in events if "sha256" in e}
+    pids = {e["pid"] for e in events if "pid" in e}
+    addresses = {e["address"] for e in events if "address" in e}
+    paths = {e["path"] for e in events if "path" in e}
+    runs = {e["run_id"] for e in events if e.get("run_id")}
+
+    print("\nIOC summary:")
+    print(f"  runs observed : {len(runs)}")
+    print(f"  process IDs   : {sorted(pids)}")
+    print(f"  listen addrs  : {sorted(addresses) or ['-']}")
+    print(f"  file hashes   : {sorted(hashes) or ['-']}")
+    print("  artifact paths:")
+    for p in sorted(paths):
+        print(f"    - {p}")
+
+
+DETECTION_GUIDE = r"""
+BLUE-TEAM HUNTING GUIDE -- masquerading & malicious lures (MITRE T1036 / T1204)
+==============================================================================
+This lab imitates a "gift card" lure so you can practise DETECTING it. Real
+attackers disguise an executable as a harmless document (a spoofed icon, a
+double extension like `gift_card.pdf.exe`) and rely on a person to double-click
+it. Below is what to hunt for. Map each item to the events this lab records
+(run `report` to see them) so you can confirm your tooling actually caught it.
+
+1. MASQUERADING ARTIFACTS ON DISK
+   - Double / mismatched extensions: name says `.pdf`/`.txt`/`.jpg` but the
+     real type is `.exe`/`.scr`/`.js`/`.lnk`. Hunt files where the extension
+     shown to the user differs from the file's magic bytes.
+   - Icon vs. type mismatch: a document-looking icon on an executable.
+   - Unusual launch parents: a "document" that is actually a script spawning
+     an interpreter (python/wscript/powershell) -> this lab's parent->child
+     python chain is the analogue.
+   - Mark-of-the-Web: files downloaded from a browser carry a Zone.Identifier
+     Alternate Data Stream. Downloaded payloads that then execute are high
+     signal. Check with:  Get-Content <file> -Stream Zone.Identifier
+
+2. PROCESS TELEMETRY (Sysmon Event ID 1 -- Process Create)
+   Look for an interpreter spawned from a user-writable/download location, and
+   for a suspicious parent/child chain. Example Sysmon-style filter:
+     Image ENDS WITH \python.exe (or wscript.exe, mshta.exe, powershell.exe)
+     AND ParentImage in a download/temp/Desktop path
+   KQL (Microsoft Defender Advanced Hunting):
+     DeviceProcessEvents
+     | where InitiatingProcessFileName in~ ("python.exe","wscript.exe","powershell.exe")
+     | where FolderPath has_any ("\\Downloads\\","\\Temp\\","\\Desktop\\")
+     | project Timestamp, DeviceName, FileName, ProcessCommandLine,
+               InitiatingProcessFileName, InitiatingProcessCommandLine
+
+3. FILE-WRITE TELEMETRY (Sysmon Event ID 11 -- File Create)
+   The payload writing new files into the user profile (this lab writes
+   dummy_input_events.json / received_telemetry_*.json). KQL:
+     DeviceFileEvents
+     | where FolderPath has_any ("\\Downloads\\","\\Temp\\","gift_card_ir_lab")
+     | project Timestamp, DeviceName, FileName, FolderPath,
+               InitiatingProcessFileName
+
+4. NETWORK TELEMETRY (Sysmon Event ID 3 -- Network Connect)
+   Real malware beacons to a remote host; this lab uses 127.0.0.1 so you can
+   practise safely. In production, hunt an interpreter making outbound
+   connections shortly after a document was "opened". KQL:
+     DeviceNetworkEvents
+     | where InitiatingProcessFileName in~ ("python.exe","powershell.exe","wscript.exe")
+     | project Timestamp, DeviceName, RemoteIP, RemotePort,
+               InitiatingProcessFileName, InitiatingProcessCommandLine
+
+5. MOTW / DOWNLOAD PROVENANCE (Sysmon Event ID 15 -- FileCreateStreamHash)
+   Fires when a downloaded file gets a Zone.Identifier stream. Correlate an
+   EID 15 for a "document" with a later EID 1 where that same file executes.
+
+TABLETOP MAPPING (lab event -> what the detector should see)
+   gift_card_file_downloaded   -> file create + (in the real world) MOTW stream
+   child_process_launch_requested / child_process_started
+                               -> Sysmon EID 1 parent->child process chain
+   dummy_event_file_created    -> Sysmon EID 11 file create in user profile
+   loopback_request_sent       -> Sysmon EID 3 network connect (127.0.0.1 here)
+
+PREVENTIVE CONTROLS worth demoing alongside the hunt:
+   - Show file extensions in Explorer; block/inspect double extensions.
+   - Attack Surface Reduction rules for Office/script child processes.
+   - SmartScreen / MOTW enforcement; block execution from Downloads.
+   - Application control (WDAC/AppLocker) so unsigned lures cannot run.
+"""
+
+
+def detect() -> None:
+    print(DETECTION_GUIDE)
+
+
+# Files the lab itself creates; reset will only delete a directory that
+# looks like one of ours, to avoid nuking a mistyped path.
+LAB_MARKERS = ("events.jsonl", "gift_card.txt", "dummy_input_events.json")
+
+
+def reset(lab: Path) -> None:
+    lab = lab.resolve()
+    if not lab.exists():
+        print(f"nothing to remove; {lab} does not exist")
+        return
+
+    # Guard against deleting something important via a mistyped --lab-dir.
+    dangerous = {Path.home().resolve(), Path.cwd().resolve()} | set(
+        Path(lab.anchor).resolve().parents
+    )
+    dangerous.add(Path(lab.anchor).resolve())  # drive/filesystem root
+    if lab in dangerous or (lab / ".git").exists():
+        raise SystemExit(
+            f"refusing to delete {lab}: it is not a lab directory "
+            "(looks like your home, cwd, a filesystem root, or a git repo)"
+        )
+    looks_like_lab = lab == DEFAULT_LAB.resolve() or any(
+        (lab / marker).exists() for marker in LAB_MARKERS
+    )
+    if not looks_like_lab:
+        raise SystemExit(
+            f"refusing to delete {lab}: it does not contain any lab files "
+            f"({', '.join(LAB_MARKERS)}); delete it yourself if you are sure"
+        )
+
+    shutil.rmtree(lab)
+    print(f"removed {lab}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "mode", choices=["serve", "run", "child", "report", "detect", "reset"]
+    )
+    parser.add_argument(
+        "--lab-dir",
+        type=Path,
+        default=Path(os.environ.get(LAB_DIR_ENV, DEFAULT_LAB)),
+        help=f"lab working directory (default: {DEFAULT_LAB})",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get(PORT_ENV, DEFAULT_PORT)),
+        help=f"loopback port for the lab server (default: {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--announce",
+        action="store_true",
+        help="print a loud 'TRAINING SIMULATION -- SAFE' banner (run mode)",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="also show the banner as a popup window, if available (run mode)",
+    )
+    parser.add_argument(
+        "--auto-serve",
+        action="store_true",
+        help="start the loopback server in-process so `run` works in one step",
+    )
+    args = parser.parse_args(argv)
+
+    lab: Path = args.lab_dir
+    # A run id ties together every event from one exercise; child processes
+    # inherit it via the environment.
+    run_id = os.environ.get(RUN_ID_ENV) or uuid.uuid4().hex
+
+    if args.mode == "serve":
+        serve(lab, args.port, run_id)
+    elif args.mode == "run":
+        run(
+            lab,
+            args.port,
+            run_id,
+            show_banner=args.announce,
+            gui_banner=args.gui,
+            auto_serve=args.auto_serve,
+        )
+    elif args.mode == "child":
+        child(lab, args.port, run_id)
+    elif args.mode == "report":
+        report(lab)
+    elif args.mode == "detect":
+        detect()
+    else:
+        reset(lab)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["serve", "run", "child"])
-    mode = parser.parse_args().mode
-
-    if mode == "serve":
-        serve()
-    elif mode == "run":
-        run()
-    else:
-        child()
+    main()
