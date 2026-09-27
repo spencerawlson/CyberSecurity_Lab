@@ -5,8 +5,10 @@ malware infection leaves behind, so defenders can practise **detecting** them.
 
 It is **not malware and not disguised**:
 
-- All traffic stays on the loopback interface (`127.0.0.1`); the server refuses
-  to bind anywhere else.
+- All traffic stays on the loopback interface (`127.0.0.1`) by default. Running
+  the halves on separate lab VMs requires the explicit `--allow-lan` flag, which
+  permits **private/lab ranges only** (RFC1918 / CGNAT / link-local / loopback);
+  any public address is refused. See the [Cross-host](#cross-host-two-vms-on-your-lab-network) section.
 - The "download" is a plain text file that says it is simulated.
 - The "keylogger" never reads the keyboard — it writes three fixed `TEST_*`
   events.
@@ -26,7 +28,7 @@ py gift_card_lab.py run --announce --auto-serve
 Use `python` instead of `py` if `py` isn't on your system. Add `--gui` for a
 popup banner during class demos.)
 
-## Two-window version
+## Two-window version (same machine)
 
 Watch the "attacker" server separately:
 
@@ -34,6 +36,35 @@ Watch the "attacker" server separately:
 py gift_card_lab.py serve          # window 1: local-only server, leave running
 py gift_card_lab.py run --announce  # window 2: the victim opening the lure
 ```
+
+## Cross-host (two VMs on your lab network)
+
+To play the "attacker" server and the "victim" on **separate machines you
+control**, add `--allow-lan` on both sides. It permits **private/lab ranges
+only** (RFC1918, CGNAT `100.64/10`, link-local, IPv6 ULA, loopback); any
+**public** address is refused.
+
+On the **attacker** VM (e.g. Kali), host the lure server:
+
+```bash
+py gift_card_lab.py serve --allow-lan --bind 0.0.0.0 --port 8765
+# find its IP with:  ip a
+```
+
+On the **victim** VM (e.g. UbuntuServ / Debian), open the lure against it:
+
+```bash
+py gift_card_lab.py run --announce --allow-lan --server 192.168.1.50 --port 8765
+```
+
+`report` on each side shows its own half; the server records the victim's real
+source IP under `client`. Don't combine `--server` with `--auto-serve` (that
+starts a *local* server) — use `serve` on the other machine instead.
+
+> **Networking note:** Kali (VMware) and Debian/UbuntuServ (Proxmox) are on
+> different hypervisors, so they must be **bridged onto the same physical LAN**
+> to reach each other — host-only/NAT networks won't span the two hosts.
+> Confirm with `ping <server-ip>` first. Only do this on a lab network you own.
 
 ## After a run
 
@@ -55,7 +86,10 @@ connection). Everything stays on `127.0.0.1`.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--lab-dir PATH` | `%USERPROFILE%\gift_card_ir_lab` | Where artifacts and `events.jsonl` are written |
-| `--port N` | `8765` | Loopback port for the lab server |
+| `--port N` | `8765` | Port for the lab server |
+| `--bind HOST` | `127.0.0.1` | Address the server listens on (`serve`); use a LAN IP or `0.0.0.0` with `--allow-lan` |
+| `--server HOST` | `127.0.0.1` | Address the victim reaches (`run`); a private/lab host, needs `--allow-lan` |
+| `--allow-lan` | off | Permit binding/reaching your **private** lab network; public addresses are always refused |
 | `--announce` | off | Print the "TRAINING SIMULATION — SAFE" banner (`run`) |
 | `--gui` | off | Also show the banner as a popup, if available (`run`) |
 | `--auto-serve` | off | Start the loopback server in-process (`run`) |

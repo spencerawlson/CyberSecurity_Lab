@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -44,11 +46,17 @@ from urllib.request import Request, urlopen
 
 DEFAULT_LAB = Path.home() / "gift_card_ir_lab"
 DEFAULT_PORT = 8765
-HOST = "127.0.0.1"  # loopback only; see assert_loopback()
+HOST = "127.0.0.1"  # loopback by default; see assert_lab_target/assert_lab_bind
 MAX_BODY_BYTES = 1 * 1024 * 1024  # reject oversized telemetry posts
 RUN_ID_ENV = "GIFT_CARD_LAB_RUN_ID"
 LAB_DIR_ENV = "GIFT_CARD_LAB_DIR"
 PORT_ENV = "GIFT_CARD_LAB_PORT"
+SERVER_ENV = "GIFT_CARD_LAB_SERVER"  # where the victim reaches the lab server
+ALLOW_LAN_ENV = "GIFT_CARD_LAB_ALLOW_LAN"  # inherited by the child process
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+CGNAT = ipaddress.ip_network("100.64.0.0/10")  # RFC 6598, older Python misses it
+BIND_ANY = ("0.0.0.0", "::")  # bind to all local interfaces
 
 
 def timestamp() -> str:
@@ -56,11 +64,73 @@ def timestamp() -> str:
 
 
 def assert_loopback(host: str) -> None:
-    """Guarantee the lab only ever talks to itself."""
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    """Guarantee the lab only ever talks to itself (loopback-only default)."""
+    if host not in LOOPBACK:
         raise SystemExit(
             f"refusing to use non-loopback host {host!r}; this lab is "
             "loopback-only by design"
+        )
+
+
+def _url_host(host: str) -> str:
+    """Wrap IPv6 literals in brackets for use in a URL."""
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def _is_lab_ip(ip_str: str) -> bool:
+    """True only for private/lab address space -- never a public host."""
+    try:
+        ip = ipaddress.ip_address(ip_str.split("%")[0])  # drop IPv6 scope id
+    except ValueError:
+        return False
+    return bool(
+        ip.is_loopback or ip.is_private or ip.is_link_local or (ip.version == 4 and ip in CGNAT)
+    )
+
+
+def assert_lab_target(host: str, allow_lan: bool) -> None:
+    """Allow loopback always; with allow_lan, allow ONLY private/lab hosts.
+
+    Every address the host resolves to must be private (RFC1918 / CGNAT /
+    link-local / loopback / IPv6 ULA); a single public address refuses the
+    whole run. This keeps the two halves talking across your lab VMs without
+    the lab ever reaching a public host.
+    """
+    if host in LOOPBACK:
+        return
+    if not allow_lan:
+        raise SystemExit(
+            f"refusing to use non-loopback host {host!r}; pass --allow-lan to "
+            "reach another machine on your private lab network"
+        )
+    try:
+        addrs = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except socket.gaierror as exc:
+        raise SystemExit(f"could not resolve {host!r}: {exc}")
+    for addr in sorted(addrs):
+        if not _is_lab_ip(addr):
+            raise SystemExit(
+                f"refusing to use {host!r} -> {addr}: not a private/lab "
+                "address. This lab only talks to RFC1918/CGNAT/link-local/"
+                "loopback networks you control, never a public host."
+            )
+
+
+def assert_lab_bind(host: str, allow_lan: bool) -> None:
+    """Bind to loopback always; with allow_lan, a private IP or all-interfaces."""
+    if host in LOOPBACK:
+        return
+    if not allow_lan:
+        raise SystemExit(
+            f"refusing to bind non-loopback address {host!r}; pass --allow-lan "
+            "to serve on your private lab network"
+        )
+    if host in BIND_ANY:
+        return  # all interfaces on a lab box; fine on an isolated lab network
+    if not _is_lab_ip(host):
+        raise SystemExit(
+            f"refusing to bind {host!r}: not a private/lab address. Bind to a "
+            "loopback/RFC1918/link-local address or 0.0.0.0 on a lab box."
         )
 
 
@@ -70,9 +140,10 @@ BANNER = r"""
 |            *** TRAINING SIMULATION -- SAFE ***               |
 |                                                              |
 |   This is the Gift-Card IR detection lab. It is NOT malware. |
-|   It only talks to 127.0.0.1, writes clearly-labelled dummy  |
-|   files, and logs every step to events.jsonl as an answer    |
-|   key. Nothing leaves this machine. Nothing is disguised.    |
+|   It talks to 127.0.0.1 by default (or, with --allow-lan,    |
+|   only your PRIVATE lab network -- never a public host),     |
+|   writes clearly-labelled dummy files, and logs every step   |
+|   to events.jsonl as an answer key. Nothing is disguised.    |
 |                                                              |
 |   Run `python gift_card_lab.py detect` to see what a         |
 |   defender should hunt for.                                  |
@@ -96,7 +167,8 @@ def announce(gui: bool = False) -> None:
                 "Training Simulation -- SAFE",
                 "Gift-Card IR detection lab.\n\n"
                 "This is a SAFE training simulation, not malware. It stays on "
-                "127.0.0.1 and writes only clearly-labelled dummy files.",
+                "127.0.0.1 (or, with --allow-lan, only your private lab "
+                "network) and writes only clearly-labelled dummy files.",
             )
             root.destroy()
         except Exception as exc:  # tkinter missing / headless / display error
@@ -185,16 +257,20 @@ def make_handler(lab: Path, run_id: str):
     return LabHandler
 
 
-def serve(lab: Path, port: int, run_id: str) -> None:
-    assert_loopback(HOST)
+def serve(
+    lab: Path, port: int, run_id: str, bind_host: str = HOST, allow_lan: bool = False
+) -> None:
+    assert_lab_bind(bind_host, allow_lan)
     lab.mkdir(exist_ok=True)
     try:
-        server = ThreadingHTTPServer((HOST, port), make_handler(lab, run_id))
+        server = ThreadingHTTPServer((bind_host, port), make_handler(lab, run_id))
     except OSError as exc:
         raise SystemExit(
-            f"could not bind {HOST}:{port} ({exc}); try a different --port"
+            f"could not bind {bind_host}:{port} ({exc}); try a different --port"
         )
-    write_event(lab, run_id, "local_server_started", address=f"{HOST}:{port}")
+    scope = "loopback only" if bind_host in LOOPBACK else "private lab network"
+    write_event(lab, run_id, "local_server_started", address=f"{bind_host}:{port}")
+    print(f"Lab server listening on {bind_host}:{port} ({scope}). Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -203,8 +279,10 @@ def serve(lab: Path, port: int, run_id: str) -> None:
         server.server_close()
 
 
-def child(lab: Path, port: int, run_id: str) -> None:
-    assert_loopback(HOST)
+def child(
+    lab: Path, port: int, run_id: str, server_host: str = HOST, allow_lan: bool = False
+) -> None:
+    assert_lab_target(server_host, allow_lan)
     write_event(lab, run_id, "child_process_started", parent_pid=os.getppid())
 
     # These are fixed test events, not keyboard input.
@@ -218,7 +296,7 @@ def child(lab: Path, port: int, run_id: str) -> None:
     write_event(lab, run_id, "dummy_event_file_created", path=str(output))
 
     request = Request(
-        f"http://{HOST}:{port}/lab-telemetry",
+        f"http://{_url_host(server_host)}:{port}/lab-telemetry",
         data=output.read_bytes(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -228,7 +306,7 @@ def child(lab: Path, port: int, run_id: str) -> None:
             write_event(lab, run_id, "loopback_request_sent", http_status=response.status)
     except URLError as exc:
         raise SystemExit(
-            f"could not reach the lab server on {HOST}:{port} ({exc.reason}); "
+            f"could not reach the lab server on {server_host}:{port} ({exc.reason}); "
             "start it first with `serve`"
         )
 
@@ -250,11 +328,19 @@ def run(
     lab: Path,
     port: int,
     run_id: str,
+    server_host: str = HOST,
+    allow_lan: bool = False,
     show_banner: bool = False,
     gui_banner: bool = False,
     auto_serve: bool = False,
 ) -> None:
-    assert_loopback(HOST)
+    assert_lab_target(server_host, allow_lan)
+    if auto_serve and server_host not in LOOPBACK:
+        raise SystemExit(
+            "--auto-serve starts a LOCAL loopback server, which the victim "
+            f"cannot combine with --server {server_host}. Run `serve` on that "
+            "machine instead, and drop --auto-serve here."
+        )
     if show_banner:
         announce(gui=gui_banner)
     lab.mkdir(exist_ok=True)
@@ -265,13 +351,13 @@ def run(
 
     write_event(lab, run_id, "gift_card_lure_opened", scenario="training simulation")
 
-    url = f"http://{HOST}:{port}/gift-card"
+    url = f"http://{_url_host(server_host)}:{port}/gift-card"
     try:
         with urlopen(url, timeout=5) as response:
             downloaded = response.read()
     except URLError as exc:
         raise SystemExit(
-            f"could not reach the lab server on {HOST}:{port} ({exc.reason}); "
+            f"could not reach the lab server on {server_host}:{port} ({exc.reason}); "
             "start it first with `serve`"
         )
 
@@ -286,12 +372,22 @@ def run(
     )
 
     write_event(lab, run_id, "child_process_launch_requested")
-    env = dict(os.environ, **{RUN_ID_ENV: run_id, LAB_DIR_ENV: str(lab), PORT_ENV: str(port)})
-    subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "child", "--port", str(port)],
-        check=True,
-        env=env,
+    env = dict(
+        os.environ,
+        **{
+            RUN_ID_ENV: run_id,
+            LAB_DIR_ENV: str(lab),
+            PORT_ENV: str(port),
+            SERVER_ENV: server_host,
+            ALLOW_LAN_ENV: "1" if allow_lan else "",
+        },
     )
+    child_cmd = [sys.executable, str(Path(__file__).resolve()), "child", "--port", str(port)]
+    if server_host not in LOOPBACK:
+        child_cmd += ["--server", server_host]
+    if allow_lan:
+        child_cmd += ["--allow-lan"]
+    subprocess.run(child_cmd, check=True, env=env)
     write_event(lab, run_id, "simulation_completed")
     if server is not None:
         server.shutdown()
@@ -459,7 +555,26 @@ def main(argv: list[str] | None = None) -> None:
         "--port",
         type=int,
         default=int(os.environ.get(PORT_ENV, DEFAULT_PORT)),
-        help=f"loopback port for the lab server (default: {DEFAULT_PORT})",
+        help=f"port for the lab server (default: {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--bind",
+        default=HOST,
+        help="address the lab server listens on (serve mode; default "
+             "127.0.0.1). Use your lab IP or 0.0.0.0 with --allow-lan.",
+    )
+    parser.add_argument(
+        "--server",
+        default=os.environ.get(SERVER_ENV) or HOST,
+        help="address of the lab server the victim reaches (run/child; "
+             "default 127.0.0.1). Requires --allow-lan for a remote lab host.",
+    )
+    parser.add_argument(
+        "--allow-lan",
+        action="store_true",
+        default=bool(os.environ.get(ALLOW_LAN_ENV)),
+        help="permit binding/reaching your PRIVATE lab network instead of "
+             "loopback only. Public/routable addresses are always refused.",
     )
     parser.add_argument(
         "--announce",
@@ -484,18 +599,20 @@ def main(argv: list[str] | None = None) -> None:
     run_id = os.environ.get(RUN_ID_ENV) or uuid.uuid4().hex
 
     if args.mode == "serve":
-        serve(lab, args.port, run_id)
+        serve(lab, args.port, run_id, bind_host=args.bind, allow_lan=args.allow_lan)
     elif args.mode == "run":
         run(
             lab,
             args.port,
             run_id,
+            server_host=args.server,
+            allow_lan=args.allow_lan,
             show_banner=args.announce,
             gui_banner=args.gui,
             auto_serve=args.auto_serve,
         )
     elif args.mode == "child":
-        child(lab, args.port, run_id)
+        child(lab, args.port, run_id, server_host=args.server, allow_lan=args.allow_lan)
     elif args.mode == "report":
         report(lab)
     elif args.mode == "detect":
