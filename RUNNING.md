@@ -75,6 +75,35 @@ python3 gift_card_lab.py run   --allow-lan --server 192.168.1.50
 python3 ddos_sim.py      flood --allow-lan --target 192.168.1.50 --attack volumetric
 ```
 
+## Reading results afterward
+
+You **don't** need a packet capture to see what a run did — every lab writes an
+`events.jsonl` answer key that you can read any time after the run:
+
+```bash
+cd ddos_lab
+python3 ddos_sim.py report     # timeline + metrics (prints the events.jsonl path)
+python3 ddos_sim.py detect     # what a defender should hunt for
+cat ~/ddos_ir_lab/events.jsonl # the raw JSON-lines answer key
+```
+
+Same for the others — the default lab directory is under your home:
+`~/gift_card_ir_lab`, `~/ddos_ir_lab`, `~/amp_ir_lab`, `~/web_attack_lab`.
+
+Packets, on the other hand, exist **only if `tcpdump` was running during the
+run** — nothing stores them otherwise. To capture without a second terminal,
+background it, run the sim, then stop it and read the file back:
+
+```bash
+sudo tcpdump -i lo -nn -w ddos.pcap port 8768 &   # start capture in background
+python3 ddos_sim.py run --attack volumetric --announce
+sudo kill %1                                       # stop it (or: sudo pkill tcpdump)
+tcpdump -r ddos.pcap -nn -vvv -A                   # read the saved packets back
+```
+
+In short: **`report` / `detect` = what happened (always available); a `.pcap` =
+the packets (only if you captured during the run).**
+
 ## Cleanup & packet capture
 
 ```bash
@@ -85,6 +114,37 @@ sudo tcpdump -i lo -n port 8765 -w giftcard.pcap                        # Gift-C
 sudo tcpdump -i lo -n port 8768 -w ddos.pcap                            # DDoS       8768/tcp
 sudo tcpdump -i lo -n udp port 8769 -w amp.pcap                         # Amplif.    8769/udp
 sudo tcpdump -i lo -n 'port 8770 or portrange 8771-8790' -w web.pcap    # Web-Attack 8770/tcp
+```
+
+### Verbose live capture (print to screen)
+
+Watch packets in detail instead of writing a file. Swap the port for another lab
+(`8765` gift-card, `udp port 8769` amplification, `port 8770 or portrange
+8771-8790` web-attack).
+
+```bash
+sudo tcpdump -i lo -nn -vvv -tttt port 8768             # verbose, wall-clock timestamps
+sudo tcpdump -i lo -nn -vvv -A port 8768                # + ASCII payload (see HTTP)
+sudo tcpdump -i lo -nn -vvv -X port 8768                # + hex & ASCII payload
+sudo tcpdump -i lo -nn -vvv -S 'port 8768 and tcp[tcpflags] & tcp-syn != 0'  # SYNs only
+```
+
+| Flag | Effect |
+| --- | --- |
+| `-nn` | no DNS **and** no port-name lookups (raw `IP:port`) |
+| `-v` / `-vv` / `-vvv` | increasing verbosity (TTL, IP id, options, checksums) |
+| `-tttt` | human-readable wall-clock timestamp per packet |
+| `-A` / `-X` | print payload as ASCII / as hex+ASCII |
+| `-S` | absolute TCP sequence numbers (track a held connection) |
+| `-e` | also show the link-layer (Ethernet) header |
+| `-c 200` | stop after N packets |
+
+`-v` / `-A` / `-X` affect **screen** output, so they don't combine with `-w`. To
+save now and inspect verbosely later:
+
+```bash
+sudo tcpdump -i lo -nn -w ddos.pcap port 8768      # capture to file
+tcpdump -r ddos.pcap -nn -vvv -A                   # replay verbose (no sudo needed)
 ```
 
 Ports at a glance: Gift-Card **8765/tcp**, DDoS **8768/tcp**, Amplification
