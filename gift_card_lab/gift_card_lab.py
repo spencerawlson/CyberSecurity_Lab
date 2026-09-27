@@ -26,6 +26,7 @@ Modes:
 """
 
 from __future__ import annotations
+from keylogger import on_press
 
 import argparse
 import hashlib
