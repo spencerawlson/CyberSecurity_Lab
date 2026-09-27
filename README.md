@@ -1,119 +1,81 @@
-# Gift-Card IR Training Lab
+# CyberSecurity_Lab — Blue-Team Detection Training Labs
 
-A **safe, self-contained** simulation of the observable traces a "gift card scam"
-malware infection leaves behind, so defenders can practise **detecting** them.
+A collection of **safe, self-contained simulations** that reproduce the
+*observable traces* of common attacks, so defenders can practise **detecting**
+them with real tooling (Sysmon, EDR, Procmon, Wireshark/tcpdump).
 
-It is **not malware and not disguised**:
+These are **detection-training simulations, not attack tools.** Every lab:
 
-- All traffic stays on the loopback interface (`127.0.0.1`) by default. Running
-  the halves on separate lab VMs requires the explicit `--allow-lan` flag, which
-  permits **private/lab ranges only** (RFC1918 / CGNAT / link-local / loopback);
-  any public address is refused. See the [Cross-host](#cross-host-two-vms-on-your-lab-network) section.
-- The "download" is a plain text file that says it is simulated.
-- The "keylogger" never reads the keyboard — it writes three fixed `TEST_*`
-  events.
-- Every step is logged to `events.jsonl` as an answer key.
+- keeps all traffic on **loopback (`127.0.0.1`)** by default — reaching another
+  host needs an explicit `--allow-lan`, which permits **private/lab ranges only**
+  (RFC1918 / CGNAT / link-local / loopback); **public addresses are always refused**;
+- does **no source-IP spoofing** and runs **no real payloads** (dummy files, fixed
+  `TEST_*` events, logged-not-executed injection probes, bounded resource use);
+- writes an `events.jsonl` **answer key** and ships `report` (timeline + IOCs) and
+  `detect` (hunting guidance) commands.
 
-Run it on a lab/training VM. Requires Python 3.9+ (no packages to install).
+> Run these only on systems and networks you own or are explicitly authorized to
+> test. See the manual's *Rules of engagement* before you start.
+
+## The labs
+
+| Lab | Folder | Protocol / port | Simulates | MITRE |
+| --- | --- | --- | --- | --- |
+| Gift-Card IR | [gift_card_lab/](gift_card_lab/) | TCP/HTTP **8765** | Malicious lure → payload → C2 beacon → exfil | T1036, T1204, T1071, T1041 |
+| DDoS | [ddos_lab/](ddos_lab/) | TCP/HTTP **8768** | Volumetric & slow-rate denial of service | T1498, T1499 |
+| Amplification | [amplification_lab/](amplification_lab/) | **UDP 8769** | UDP reflection / amplification factor | T1498.002 |
+| Web-Attack | [web_attack_lab/](web_attack_lab/) | TCP/HTTP **8770** | Credential stuffing, enumeration, injection probes, port scan | T1110, T1595, T1190 |
+
+Each folder is self-contained: the lab script, its tests, a `README.md`, and a
+`RUN-TRAINING-SIMULATION.cmd` double-click launcher.
+
+## The operator's manual
+
+**[docs/DETECTION_LAB_MANUAL.md](docs/DETECTION_LAB_MANUAL.md)** (also as
+**[PDF](docs/DETECTION_LAB_MANUAL.pdf)**) is the full guide to running every lab
+with Sysmon, EDR, Procmon, and packet capture (Wireshark / tcpdump) — properly,
+efficiently, and ethically. It covers tool setup, the efficient run→capture→
+compare workflow, per-lab playbooks with ready-to-paste queries/filters, and the
+rules of engagement.
 
 ## Quick start
 
-**Double-click** `RUN-TRAINING-SIMULATION.cmd`, or from a terminal in this folder:
+Requires **Python 3.9+** (standard library only — nothing to install).
 
 ```powershell
-py gift_card_lab.py run --announce --auto-serve
+cd gift_card_lab
+py gift_card_lab.py run --announce --auto-serve   # run a scenario
+py gift_card_lab.py report                         # see the answer key
+py gift_card_lab.py detect                         # see what to hunt for
+py gift_card_lab.py reset                          # clean up
 ```
 
-(`--auto-serve` starts the loopback server in-process, so this is all you need.
-Use `python` instead of `py` if `py` isn't on your system. Add `--gui` for a
-popup banner during class demos.)
+Every lab follows the same `serve` / attack / `run` / `report` / `detect` /
+`reset` pattern — see each lab's own `README.md` for its specific modes and flags.
 
-## Two-window version (same machine)
+## Running the tests
 
-Watch the "attacker" server separately:
+From any lab folder:
 
 ```powershell
-py gift_card_lab.py serve          # window 1: local-only server, leave running
-py gift_card_lab.py run --announce  # window 2: the victim opening the lure
+py -m pytest -q
 ```
 
-## Cross-host (two VMs on your lab network)
+## Repository layout
 
-To play the "attacker" server and the "victim" on **separate machines you
-control**, add `--allow-lan` on both sides. It permits **private/lab ranges
-only** (RFC1918, CGNAT `100.64/10`, link-local, IPv6 ULA, loopback); any
-**public** address is refused.
-
-On the **attacker** VM (e.g. Kali), host the lure server:
-
-```bash
-py gift_card_lab.py serve --allow-lan --bind 0.0.0.0 --port 8765
-# find its IP with:  ip a
+```
+CyberSecurity_Lab/
+├─ README.md                     (this file)
+├─ docs/
+│  ├─ DETECTION_LAB_MANUAL.md
+│  └─ DETECTION_LAB_MANUAL.pdf
+├─ gift_card_lab/                lure → payload → C2 beacon → exfil
+├─ ddos_lab/                     volumetric & slow-rate DoS
+├─ amplification_lab/            UDP reflection / amplification
+└─ web_attack_lab/               credstuff / enum / inject / portscan
 ```
 
-On the **victim** VM (e.g. UbuntuServ / Debian), open the lure against it:
+---
 
-```bash
-py gift_card_lab.py run --announce --allow-lan --server 192.168.1.50 --port 8765
-```
-
-`report` on each side shows its own half; the server records the victim's real
-source IP under `client`. Don't combine `--server` with `--auto-serve` (that
-starts a *local* server) — use `serve` on the other machine instead.
-
-> **Networking note:** Kali (VMware) and Debian/UbuntuServ (Proxmox) are on
-> different hypervisors, so they must be **bridged onto the same physical LAN**
-> to reach each other — host-only/NAT networks won't span the two hosts.
-> Confirm with `ping <server-ip>` first. Only do this on a lab network you own.
-
-## After a run
-
-```powershell
-py gift_card_lab.py report   # timeline + IOC summary (the answer key)
-py gift_card_lab.py detect   # blue-team hunting guide (Sysmon / KQL queries)
-py gift_card_lab.py reset    # wipe the lab dir to repeat cleanly
-```
-
-## The exercise
-
-While it runs, have your detection tooling active — Sysmon, EDR, Procmon, or a
-loopback packet capture. Then compare what your tools caught against `report`,
-using `detect` for what to hunt for (process chain, file writes, the loopback
-connection). Everything stays on `127.0.0.1`.
-
-## Options
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--lab-dir PATH` | `%USERPROFILE%\gift_card_ir_lab` | Where artifacts and `events.jsonl` are written |
-| `--port N` | `8765` | Port for the lab server |
-| `--bind HOST` | `127.0.0.1` | Address the server listens on (`serve`); use a LAN IP or `0.0.0.0` with `--allow-lan` |
-| `--server HOST` | `127.0.0.1` | Address the victim reaches (`run`); a private/lab host, needs `--allow-lan` |
-| `--allow-lan` | off | Permit binding/reaching your **private** lab network; public addresses are always refused |
-| `--announce` | off | Print the "TRAINING SIMULATION — SAFE" banner (`run`) |
-| `--gui` | off | Also show the banner as a popup, if available (`run`) |
-| `--auto-serve` | off | Start the loopback server in-process (`run`) |
-
-## Modes
-
-| Mode | Role | What it does |
-| --- | --- | --- |
-| `serve` | Attacker host | Local-only HTTP server: serves the file, receives dummy telemetry |
-| `run` | Victim | Opens the lure, downloads the file, records its hash, spawns the child |
-| `child` | Payload | Writes fixed `TEST_*` events and POSTs them back over loopback (spawned by `run`; not run directly) |
-| `report` | — | Prints a timeline and IOC summary |
-| `detect` | — | Prints blue-team detection guidance |
-| `reset` | — | Deletes the lab directory (guarded so it won't delete a non-lab path) |
-
-## Files
-
-- `gift_card_lab.py` — the lab
-- `test_gift_card_lab.py` — tests (`py test_gift_card_lab.py`)
-- `RUN-TRAINING-SIMULATION.cmd` — honest double-click launcher
-- `make-shortcut.ps1` — creates a clearly-labelled desktop shortcut (standard icon, no disguise)
-
-## Optional: desktop shortcut
-
-```powershell
-powershell -ExecutionPolicy Bypass -File make-shortcut.ps1
-```
+*For authorized detection training only. You are responsible for using these labs
+lawfully and on systems you own or are permitted to test.*
