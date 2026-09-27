@@ -91,18 +91,136 @@ Same for the others — the default lab directory is under your home:
 `~/gift_card_ir_lab`, `~/ddos_ir_lab`, `~/amp_ir_lab`, `~/web_attack_lab`.
 
 Packets, on the other hand, exist **only if `tcpdump` was running during the
-run** — nothing stores them otherwise. To capture without a second terminal,
-background it, run the sim, then stop it and read the file back:
-
-```bash
-sudo tcpdump -i lo -nn -w ddos.pcap port 8768 &   # start capture in background
-python3 ddos_sim.py run --attack volumetric --announce
-sudo kill %1                                       # stop it (or: sudo pkill tcpdump)
-tcpdump -r ddos.pcap -nn -vvv -A                   # read the saved packets back
-```
+run** — nothing stores them otherwise. See
+[Capturing packets reliably](#capturing-packets-reliably) below for how to catch
+them, including leaving a capture running so timing never bites you.
 
 In short: **`report` / `detect` = what happened (always available); a `.pcap` =
 the packets (only if you captured during the run).**
+
+## Capturing packets reliably
+
+`tcpdump` only records while it is actually running, so an **empty capture**
+(reading it prints just the `reading from file …` header and no packets) almost
+always means the capture and the traffic didn't overlap in time — not a filter or
+interface problem. Two habits avoid it: start the capture **before** the sim, and
+**verify** it caught something.
+
+### Verify it works (two terminals)
+
+Run a live view first — if packets scroll while the sim runs, your interface and
+filter are correct:
+
+```bash
+# Terminal A — live view, no file
+sudo tcpdump -i lo -nn -vvv port 8768
+# Terminal B — generate traffic
+python3 ddos_sim.py run --attack volumetric --announce
+```
+
+Then capture to a file and trust the count `tcpdump` prints when you stop it:
+
+```bash
+sudo tcpdump -i lo -nn -w ddos.pcap port 8768      # Ctrl+C after the sim finishes
+#  -> "NNN packets captured"   <-- must be > 0
+tcpdump -r ddos.pcap -nn | wc -l                   # sanity-count afterward
+```
+
+### One terminal (background, with a real delay)
+
+The usual reason a backgrounded capture comes back empty is that the sim starts
+(and finishes) before `tcpdump` has attached. Give it a proper `sleep`, and let
+it run a beat past the end of the run:
+
+```bash
+sudo tcpdump -i lo -nn -w ddos.pcap port 8768 &    # needs sudo
+sleep 2                                             # let tcpdump attach FIRST
+python3 ddos_sim.py run --attack volumetric --announce
+sleep 1                                             # let the tail of the traffic land
+sudo pkill -INT -f 'tcpdump.*ddos.pcap'             # -INT stops it AND prints the count
+tcpdump -r ddos.pcap -nn | wc -l
+```
+
+(Capturing needs `sudo`; reading a `.pcap` back does not. Don't use `sudo kill
+%1` — `%1` is a shell job-spec `sudo` can't resolve; use `pkill` as above.)
+
+### Where the file lands
+
+`-w ddos.pcap` writes **relative to the directory `tcpdump` was launched from**,
+so a capture started from your home directory leaves `~/ddos.pcap`, not one in
+`ddos_lab/`. Use an absolute path to keep captures beside their lab:
+
+```bash
+sudo tcpdump -i lo -nn -w ~/CyberSecurity_Lab/ddos_lab/ddos.pcap port 8768
+find ~ -name '*.pcap' 2>/dev/null                  # locate strays if unsure
+```
+
+### Leave it running (continuous / always-on capture)
+
+**Yes — `tcpdump` is built to run for days, and on a defender box like UbuntuServ
+you can absolutely leave it running.** A persistent capture filtered to the lab
+ports is in fact the cleanest fix for the timing problem: start it once, then run
+any sim whenever and it is recorded. The only thing to manage is **disk**, so use
+a **ring buffer** (`-C` = size per file in MB, `-W` = number of files → bounded
+total) and drop root right after the capture socket opens (`-Z`):
+
+```bash
+mkdir -p ~/captures
+sudo tcpdump -i lo -nn -Z "$USER" \
+  -w ~/captures/lab.pcap -C 50 -W 10 \
+  'port 8765 or port 8768 or udp port 8769 or portrange 8770-8790'
+#  -> lab.pcap0 .. lab.pcap9, ~50 MB each, oldest recycled (~500 MB ceiling)
+```
+
+Prefer time-based files? Rotate hourly (unique strftime name; add `-W 24` to keep
+a rolling day):
+
+```bash
+sudo tcpdump -i lo -nn -Z "$USER" -G 3600 -W 24 \
+  -w '~/captures/lab-%Y%m%d-%H.pcap' \
+  'port 8765 or port 8768 or udp port 8769 or portrange 8770-8790'
+```
+
+Make it survive an SSH logout with **tmux** (quickest):
+
+```bash
+tmux new -s cap        # run the tcpdump line inside; Ctrl-b then d to detach
+tmux attach -t cap     # come back later; Ctrl-C to stop
+```
+
+Or run it as a **systemd service** so it starts on boot and restarts on failure —
+`/etc/systemd/system/lab-capture.service`:
+
+```ini
+[Unit]
+Description=Loopback lab packet capture (ring buffer)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/tcpdump -i lo -nn -Z sspady -w /home/sspady/captures/lab.pcap -C 50 -W 10 port 8765 or port 8768 or udp port 8769 or portrange 8770-8790
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo mkdir -p /home/sspady/captures
+sudo systemctl enable --now lab-capture
+sudo systemctl status lab-capture      # confirm it's active
+journalctl -u lab-capture -f           # watch it
+```
+
+Notes for a long-running capture:
+
+- On exit `tcpdump` reports "packets dropped by kernel"; if that's non-zero on a
+  busy link, raise the buffer (`-B 4096`, in KiB) or tighten the filter. On the
+  labs' loopback traffic the volume is tiny, so drops are a non-issue.
+- Full-packet capture records payloads. That's fine on your own lab loopback, but
+  treat the `.pcap`s as sensitive on any real network, and prefer `-Z "$USER"` so
+  the files aren't owned by root.
+- Reading any rotated file works the same way: `tcpdump -r ~/captures/lab.pcap3
+  -nn -vvv -A`, or merge them with `mergecap -w all.pcap ~/captures/lab.pcap*`.
 
 ## Cleanup & packet capture
 
