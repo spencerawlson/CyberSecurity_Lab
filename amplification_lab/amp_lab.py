@@ -314,6 +314,15 @@ DETECTION (as an unwitting REFLECTOR -- don't be the amplifier)
      memcached stats). This lab's reflector logs bytes_in vs bytes_out; a real
      monitor watches that ratio per service.
 
+PACKET CAPTURE (measure the factor yourself)
+   This is fundamentally a packet-size story, so watch it on the wire:
+     tcpdump -i lo -n udp port 8769 -w amp.pcap   (on Windows capture on the
+     Npcap loopback adapter)
+   - In Wireshark filter `udp.port == 8769` and compare the query packet length
+     to the response length -- that ratio IS the amplification factor.
+   - Statistics > Conversations (UDP) shows bytes-out vs bytes-in per flow; the
+     oversized responses are what a spoofed victim would be drowned in.
+
 MITIGATIONS
    - BCP38 / ingress filtering so spoofed source IPs can't leave a network.
    - Disable/restrict amplifiers: NTP monlist off, memcached not on UDP/public,

@@ -61,6 +61,10 @@ From any lab folder:
 py -m pytest -q
 ```
 
+Every push and pull request also runs all four suites on Ubuntu and Windows
+(Python 3.9 and 3.13) via GitHub Actions — see
+[.github/workflows/tests.yml](.github/workflows/tests.yml).
+
 ## Repository layout
 
 ```

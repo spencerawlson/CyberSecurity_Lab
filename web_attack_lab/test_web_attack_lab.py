@@ -91,5 +91,20 @@ class ReportingTests(unittest.TestCase):
             lab.reset(Path(tmp.name))
 
 
+class DetectGuideTest(unittest.TestCase):
+    def test_detect_covers_technique_and_capture(self):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lab.detect()
+        out = buf.getvalue()
+        self.assertIn("T1110", out)   # brute force / credential stuffing
+        self.assertIn("T1595", out)   # active scanning
+        self.assertIn("tcp.flags.syn", out)  # packet-capture guidance present
+        self.assertIn("8770", out)           # scoped to the victim port
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

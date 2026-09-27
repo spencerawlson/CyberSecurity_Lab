@@ -681,6 +681,18 @@ and confirm your tooling caught it.
      high connection-attempt fan-out. NetFlow: one src -> many dst ports.
    - Controls: rate limit, tarpit, alert, and reduce exposed surface.
 
+5. PACKET-CAPTURE VIEW (on the wire)
+   The logs tell most of the story, but capture confirms it and catches the
+   scan the app never sees. Capture the victim + its sensor ports:
+     tcpdump -i lo -n 'port 8770 or portrange 8771-8790' -w web.pcap   (on
+     Windows capture on the Npcap loopback adapter)
+   - credstuff / enum: Wireshark `http.request` shows the POST /login burst;
+     `http.response.code == 404` isolates the enumeration sweep.
+   - inject: the payload markers are visible in the request URI/body on the wire
+     (and logged, never executed).
+   - portscan: `tcp.flags.syn==1 && tcp.flags.ack==0` reveals one source's SYNs
+     fanning across many ports (connections to closed ports draw a RST).
+
 TABLETOP MAPPING (lab event -> what the detector should see)
    auth_failure_threshold_exceeded -> brute-force / credential-stuffing alert
    not_found_threshold_exceeded    -> enumeration / dir-busting alert

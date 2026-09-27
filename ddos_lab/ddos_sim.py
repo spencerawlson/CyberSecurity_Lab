@@ -872,6 +872,19 @@ Which lab metric exposes each (see `report` / victim_metrics_final):
      flat or dropping despite more requests -> capacity exhausted.
    - Correlate the health dip with the traffic spike in the same window.
 
+5. PACKET-CAPTURE / FLOW VIEW (on the wire)
+   Watch the *shape* of the traffic, not just the counts. Capture the victim
+   port (loopback here) and open it in Wireshark:
+     tcpdump -i lo -n port 8768 -w ddos.pcap   (Linux/macOS; on Windows capture
+     on the Npcap loopback adapter)
+   - volumetric / cachebust: Statistics > I/O Graph shows the requests/sec
+     spike; Statistics > Conversations shows the source fan-out.
+   - connflood: a fresh SYN per request -- many short-lived connections rather
+     than keep-alive reuse.
+   - slow-rate (slowloris/rudy/slowread): filter `tcp.flags.syn==1` for opens,
+     then look for connections that stay ESTABLISHED with little/no data and
+     never cleanly FIN -- concurrency holds while completions stay flat.
+
 MITIGATIONS worth demoing alongside the hunt:
    - Rate limiting / connection limits per source (nginx limit_req/limit_conn,
      HAProxy, WAF); tighten header/read timeouts to kill slowloris holds.

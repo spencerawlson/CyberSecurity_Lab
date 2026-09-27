@@ -183,5 +183,20 @@ class ReportingTests(unittest.TestCase):
         self.assertTrue(empty.exists())
 
 
+class DetectGuideTest(unittest.TestCase):
+    def test_detect_covers_technique_and_capture(self):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lab.detect()
+        out = buf.getvalue()
+        self.assertIn("T1498", out)   # network DoS
+        self.assertIn("T1499", out)   # endpoint DoS
+        self.assertIn("tcpdump", out)  # packet-capture guidance present
+        self.assertIn("8768", out)     # scoped to the victim port
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
