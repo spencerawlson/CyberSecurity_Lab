@@ -26,7 +26,7 @@ Modes:
 """
 
 from __future__ import annotations
-from monitoring import listener, clipboard_thread, screen_thread, activity_thread
+
 
 import argparse
 import hashlib
@@ -756,14 +756,6 @@ def main(argv: list[str] | None = None) -> None:
         detect()
     else:
         reset(lab)
-
-listener.join()
-
-clipboard_thread.join()
-
-screen_thread.join()
-
-activity_thread.join()
 
 if __name__ == "__main__":
     main()
