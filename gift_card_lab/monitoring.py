@@ -4,7 +4,7 @@ import time
 from PIL import ImageGrab
 import os
 import psutil
-import pygetwindow as gw
+import pygetwindow as gw  # type: ignore[import-untyped]
 import threading
 
 
