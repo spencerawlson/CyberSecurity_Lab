@@ -1,0 +1,132 @@
+/* spencerlab.tech — CyberSecurity_Lab page.
+   CSP-safe: this is an EXTERNAL stylesheet (default-src 'self' blocks inline
+   <style>/style="" and any CDN). No web fonts, no JS — system fonts only. */
+
+:root {
+  --bg: #0a0e14;
+  --bg-soft: #10151f;
+  --panel: #141b26;
+  --border: #223044;
+  --ink: #e6edf3;
+  --muted: #9aa7b6;
+  --dim: #6b7a8d;
+  --accent: #34d399;      /* emerald */
+  --accent-2: #38bdf8;    /* cyan */
+  --danger: #f87171;
+  --radius: 14px;
+  --maxw: 1000px;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(56, 189, 248, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 0% 0%, rgba(52, 211, 153, 0.08), transparent 55%),
+    var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  line-height: 1.6;
+  font-size: 16px;
+}
+
+.wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 20px; }
+
+a { color: var(--accent-2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, .mono {
+  font-family: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 0.9em;
+}
+
+/* ---- top bar ---- */
+.topbar {
+  border-bottom: 1px solid var(--border);
+  background: rgba(10, 14, 20, 0.7);
+  position: sticky; top: 0; z-index: 10;
+  backdrop-filter: blur(8px);
+}
+.topbar .wrap { display: flex; align-items: center; gap: 12px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--ink); }
+.brand svg { display: block; }
+.topbar nav { margin-left: auto; display: flex; gap: 18px; }
+.topbar nav a { color: var(--muted); font-size: 0.92rem; }
+.topbar nav a:hover { color: var(--ink); text-decoration: none; }
+
+/* ---- hero ---- */
+.hero { padding: 64px 0 40px; border-bottom: 1px solid var(--border); }
+.eyebrow {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 0.75rem; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--accent); border: 1px solid var(--border);
+  padding: 5px 12px; border-radius: 999px; background: var(--bg-soft);
+}
+.hero h1 { font-size: clamp(1.9rem, 4vw, 3rem); line-height: 1.1; margin: 20px 0 12px; }
+.hero p.lead { font-size: 1.12rem; color: var(--muted); max-width: 72ch; margin: 0 0 24px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 11px 18px; border-radius: 10px; font-weight: 600; font-size: 0.95rem;
+  border: 1px solid var(--border); color: var(--ink); background: var(--panel);
+}
+.btn:hover { border-color: var(--accent-2); text-decoration: none; }
+.btn.primary { background: linear-gradient(180deg, var(--accent), #10b981); color: #06231a; border-color: transparent; }
+.btn.primary:hover { filter: brightness(1.06); }
+
+/* ---- safety banner ---- */
+.safety {
+  margin: 28px 0 0; padding: 16px 18px; border-radius: var(--radius);
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.07);
+  color: var(--ink); font-size: 0.95rem;
+}
+.safety strong { color: var(--accent); }
+
+/* ---- sections ---- */
+section { padding: 48px 0; border-bottom: 1px solid var(--border); }
+.no-border { border-bottom: none; }
+section h2 { font-size: 1.5rem; margin: 0 0 6px; }
+section .sub { color: var(--dim); margin: 0 0 26px; }
+
+/* ---- lab cards ---- */
+.grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px; display: flex; flex-direction: column;
+}
+.card h3 { margin: 0 0 4px; font-size: 1.15rem; display: flex; align-items: center; gap: 10px; }
+.card .port { font-size: 0.72rem; color: var(--accent-2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; font-weight: 600; }
+.card p { margin: 8px 0 14px; color: var(--muted); font-size: 0.95rem; }
+.card ul { margin: 0 0 14px; padding-left: 18px; color: var(--muted); font-size: 0.9rem; }
+.card ul li { margin: 3px 0; }
+.card .tags { margin-top: auto; display: flex; flex-wrap: wrap; gap: 6px; }
+.tag { font-size: 0.7rem; color: var(--dim); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; }
+.tag.new { color: var(--accent); border-color: rgba(52, 211, 153, 0.4); }
+
+/* ---- steps / code ---- */
+pre {
+  background: #0b1017; border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px; overflow-x: auto; color: #cfe3f2; font-size: 0.88rem; line-height: 1.5;
+}
+pre .c { color: var(--dim); }
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 8px; }
+.step { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+.step .n { color: var(--accent); font-weight: 700; font-size: 0.8rem; }
+.step h4 { margin: 6px 0 4px; font-size: 1rem; }
+.step p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+/* ---- footer ---- */
+footer { padding: 32px 0 60px; color: var(--dim); font-size: 0.85rem; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; }
+footer a { color: var(--muted); }
+
+@media (max-width: 720px) {
+  .grid, .steps { grid-template-columns: 1fr; }
+  .topbar nav { display: none; }
+}

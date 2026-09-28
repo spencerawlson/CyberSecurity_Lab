@@ -49,6 +49,9 @@ def test_full_flow(tmp_path: Path):
     assert "child_process_started" in names
     assert "loopback_request_sent" in names
     assert "dummy_telemetry_received" in names
+    # Persistence stage ran between payload and completion
+    assert "persistence_run_key_set" in names
+    assert "persistence_scheduled_task_created" in names
 
     # Artifacts exist and the recorded hash matches the downloaded file
     downloaded = lab_dir / "gift_card.txt"
@@ -105,6 +108,49 @@ def test_run_auto_serve_starts_own_server(tmp_path: Path):
     assert "local_server_started" in names
     assert "dummy_telemetry_received" in names
     assert "simulation_completed" in names
+
+
+def test_persist_writes_simulated_artifacts_only(tmp_path: Path):
+    server_dir = tmp_path / "server"
+    client_dir = tmp_path / "client"
+    port = _free_port()
+    run_id = "persist000000000"
+
+    server = _serve_in_thread(server_dir, port, run_id)
+    try:
+        lab.persistence(client_dir, port, run_id)
+    finally:
+        server.shutdown()
+
+    events = lab.load_events(client_dir)
+    names = [e["event"] for e in events]
+    assert "persistence_run_key_set" in names
+    assert "persistence_scheduled_task_created" in names
+
+    run_key = next(e for e in events if e["event"] == "persistence_run_key_set")
+    task = next(e for e in events if e["event"] == "persistence_scheduled_task_created")
+    assert run_key["technique"] == "T1547.001" and run_key["simulated"] is True
+    assert task["technique"] == "T1053.005" and task["simulated"] is True
+
+    # Artifacts are written to the lab dir and clearly announce they are simulated
+    # and NOT applied to the real system.
+    reg = (client_dir / "persistence_run_key.reg").read_text()
+    xml = (client_dir / "persistence_scheduled_task.xml").read_text()
+    assert "SIMULATED" in reg and "NOT imported" in reg
+    assert "SIMULATED" in xml and "NOT registered" in xml
+    assert lab.PERSIST_VALUE_NAME in reg
+    assert lab.PERSIST_TASK_NAME in xml
+
+
+def test_persist_without_server_still_writes_host_artifacts(tmp_path: Path):
+    # Persistence is a host artifact: an unreachable C2 must NOT abort it.
+    client_dir = tmp_path / "client"
+    port = _free_port()  # nothing listening
+    lab.persistence(client_dir, port, "noc2000000000000")
+    names = [e["event"] for e in lab.load_events(client_dir)]
+    assert "persistence_run_key_set" in names
+    assert "persistence_beacon_skipped" in names  # POST failed, artifacts still written
+    assert (client_dir / "persistence_run_key.reg").exists()
 
 
 def test_beacon_sends_periodic_checkins(tmp_path: Path):
@@ -212,6 +258,8 @@ def test_detect_prints_guide():
     out = buf.getvalue()
     assert "T1036" in out
     assert "DeviceProcessEvents" in out  # a real hunting query is present
+    assert "T1547.001" in out  # persistence: Run key
+    assert "T1053.005" in out  # persistence: scheduled task
     assert "T1071" in out  # C2 beaconing section (beacon mode)
     assert "T1041" in out  # data-exfiltration section (exfil mode)
 

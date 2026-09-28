@@ -66,6 +66,24 @@ class AttackTests(unittest.TestCase):
         lab.inject("127.0.0.1", self.port, workers=4, rounds=1, source="203.0.113.3")
         self.assertGreater(self.metrics.snapshot()["injection_probes"], 0)
 
+    def test_ssrf_probes_logged_not_fetched(self):
+        lab.ssrf("127.0.0.1", self.port, workers=4, rounds=1, source="203.0.113.4")
+        snap = self.metrics.snapshot()
+        # Most SSRF payloads are pure-SSRF; a file:///etc/passwd probe is
+        # legitimately both SSRF and LFI, so we only require the SSRF signal here.
+        self.assertGreaterEqual(snap["ssrf_probes"], len(lab.SSRF_PAYLOADS) - 1)
+
+    def test_traversal_probes_logged_not_opened(self):
+        lab.traversal("127.0.0.1", self.port, workers=4, rounds=1, source="203.0.113.5")
+        snap = self.metrics.snapshot()
+        self.assertGreater(snap["traversal_probes"], 0)
+
+    def test_ssrf_marker_detection_covers_metadata_and_schemes(self):
+        for p in ("/x?url=http://169.254.169.254/latest/meta-data/",
+                  "/y?target=file:///etc/passwd",
+                  "/z?src=http://metadata.google.internal/"):
+            self.assertTrue(any(m in p.lower() for m in lab.SSRF_MARKERS), p)
+
     def test_portscan_trips_many_sensor_ports(self):
         res = lab.portscan("127.0.0.1", self.port, source="127.0.0.1")
         self.assertGreater(res["open"], 5)  # sensor bank answered
@@ -102,6 +120,9 @@ class DetectGuideTest(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("T1110", out)   # brute force / credential stuffing
         self.assertIn("T1595", out)   # active scanning
+        self.assertIn("T1552.005", out)  # cloud instance metadata (SSRF)
+        self.assertIn("SSRF", out)       # server-side request forgery section
+        self.assertIn("T1083", out)      # file/dir discovery (traversal)
         self.assertIn("tcp.flags.syn", out)  # packet-capture guidance present
         self.assertIn("8770", out)           # scoped to the victim port
 

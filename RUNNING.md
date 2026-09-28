@@ -47,6 +47,11 @@ python3 web_attack_lab.py run --attack credstuff --announce   # also: enum injec
 python3 gift_card_lab.py serve                                    # terminal 1 (leave running)
 python3 gift_card_lab.py beacon --beacons 20 --interval 2 --jitter 0.5   # terminal 2
 python3 gift_card_lab.py exfil  --exfil-bytes 262144 --chunk 16384        # terminal 2
+
+# Optional: real LOCAL host telemetry during a run (keystrokes/clipboard/
+# screenshots/processes). Off by default; own/authorized machines only. Needs
+# `pip install -r gift_card_lab/requirements.txt`. See gift_card_lab/README.md.
+python3 gift_card_lab.py run --announce --auto-serve --with-monitoring
 ```
 
 ## Two terminals on one machine (watch the listener separately)
@@ -188,7 +193,8 @@ tmux new -s cap        # run the tcpdump line inside; Ctrl-b then d to detach
 tmux attach -t cap     # come back later; Ctrl-C to stop
 ```
 
-Or run it as a **systemd service** so it starts on boot and restarts on failure —
+Or run it as a **systemd service** so it starts on boot and restarts on failure
+(replace `youruser` below with your own login name) —
 `/etc/systemd/system/lab-capture.service`:
 
 ```ini
@@ -197,7 +203,7 @@ Description=Loopback lab packet capture (ring buffer)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/tcpdump -i lo -nn -Z sspady -w /home/sspady/captures/lab.pcap -C 50 -W 10 port 8765 or port 8768 or udp port 8769 or portrange 8770-8790
+ExecStart=/usr/bin/tcpdump -i lo -nn -Z youruser -w /home/youruser/captures/lab.pcap -C 50 -W 10 port 8765 or port 8768 or udp port 8769 or portrange 8770-8790
 Restart=on-failure
 
 [Install]
@@ -205,7 +211,7 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo mkdir -p /home/sspady/captures
+sudo mkdir -p /home/youruser/captures
 sudo systemctl enable --now lab-capture
 sudo systemctl status lab-capture      # confirm it's active
 journalctl -u lab-capture -f           # watch it

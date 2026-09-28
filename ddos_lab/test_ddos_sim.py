@@ -154,6 +154,17 @@ class VictimMetricsTests(unittest.TestCase):
         # Slow POST body holds the server blocked reading -> concurrency climbs.
         self.assertGreaterEqual(snap["peak_concurrent"], 4)
 
+    def test_rapidreset_aborts_connections_without_completing(self):
+        result = lab.flood(
+            self.lab_dir, self.port, "rr", "rapidreset", workers=8, duration=2
+        )
+        self.assertGreater(result["streams"], 0)
+        snap = self.metrics.snapshot()
+        # Streams are opened then cancelled: connections abort before any request
+        # completes, so aborted_connections climbs while total_requests stays low.
+        self.assertGreater(snap["aborted_connections"], 5)
+        self.assertGreater(snap["aborted_connections"], snap["total_requests"])
+
 
 class ReportingTests(unittest.TestCase):
     def test_run_writes_answer_key_with_spike(self):
@@ -194,6 +205,8 @@ class DetectGuideTest(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("T1498", out)   # network DoS
         self.assertIn("T1499", out)   # endpoint DoS
+        self.assertIn("CVE-2023-44487", out)  # HTTP/2 rapid reset
+        self.assertIn("rapidreset", out)      # the new vector is documented
         self.assertIn("tcpdump", out)  # packet-capture guidance present
         self.assertIn("8768", out)     # scoped to the victim port
 

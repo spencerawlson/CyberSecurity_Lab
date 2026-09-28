@@ -19,6 +19,8 @@ Modes:
           Add --announce for a loud "TRAINING SIMULATION" banner, and
           --auto-serve to start the loopback server in-process (one click).
   child   Internal: the child process spawned by ``run`` (not run directly).
+  persist Simulate the persistence stage (autostart Run key + scheduled task,
+          written as artifacts only -- never applied to the real system).
   report  Print a timeline and IOC summary from the recorded events.
   detect  Print blue-team hunting guidance for the technique this lab imitates
           (masquerading / lures) -- indicators plus Sysmon and KQL queries.
@@ -26,8 +28,6 @@ Modes:
 """
 
 from __future__ import annotations
-
-
 import argparse
 import hashlib
 import ipaddress
@@ -48,6 +48,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_LAB = Path.home() / "gift_card_ir_lab"
 DEFAULT_PORT = 8765
+DEFAULT_RUN_SECONDS = 60
 HOST = "127.0.0.1"  # loopback by default; see assert_lab_target/assert_lab_bind
 MAX_BODY_BYTES = 1 * 1024 * 1024  # reject oversized telemetry posts
 RUN_ID_ENV = "GIFT_CARD_LAB_RUN_ID"
@@ -262,6 +263,7 @@ def make_handler(lab: Path, run_id: str):
             # /lab-telemetry: store the dummy lab data (timestamped filename).
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
             out = lab / f"received_telemetry_{stamp}.json"
+            lab.mkdir(parents=True, exist_ok=True)  # match write_event; survive teardown races
             out.write_bytes(body)
             write_event(
                 lab,
@@ -334,6 +336,79 @@ def child(
         )
 
     time.sleep(3)  # Briefly leaves the child visible in process listings.
+
+
+# Simulated persistence IOCs. These describe what a real implant WOULD register
+# to survive reboot; the lab only writes artifact files into the lab directory --
+# it never touches the real Windows registry or Task Scheduler.
+PERSIST_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+PERSIST_VALUE_NAME = "GiftCardHelper"
+PERSIST_TASK_NAME = "GiftCardUpdater"
+
+
+def persistence(
+    lab: Path, port: int, run_id: str, server_host: str = HOST, allow_lan: bool = False
+) -> None:
+    """Simulated persistence stage -- the step between payload and C2.
+
+    A real implant survives reboot by planting an autostart, most often a
+    Registry Run key (MITRE T1547.001) and/or a Scheduled Task (T1053.005). This
+    lab does NOT modify the real registry or create a real scheduled task. It
+    writes two clearly-labelled artifact files describing what an implant WOULD
+    register and logs the IOCs to the answer key, so a defender can practise
+    hunting autostart entries with Autoruns / Sysmon / EDR.
+    """
+    assert_lab_target(server_host, allow_lan)
+    lab.mkdir(parents=True, exist_ok=True)
+    payload_cmd = f'python "{lab / "gift_card_payload.py"}"'
+
+    # Artifact 1: a .reg-style file describing the Run key (never imported).
+    run_key_file = lab / "persistence_run_key.reg"
+    run_key_file.write_text(
+        "Windows Registry Editor Version 5.00\n\n"
+        "; SIMULATED training artifact only -- NOT imported into the registry.\n"
+        f"[{PERSIST_RUN_KEY}]\n"
+        f'"{PERSIST_VALUE_NAME}"="{payload_cmd}"\n',
+        encoding="utf-8",
+    )
+    write_event(lab, run_id, "persistence_run_key_set", technique="T1547.001",
+                hive="HKCU", key=PERSIST_RUN_KEY, value_name=PERSIST_VALUE_NAME,
+                command=payload_cmd, artifact=str(run_key_file), simulated=True)
+
+    # Artifact 2: a schtasks-style XML describing the task (never registered).
+    task_file = lab / "persistence_scheduled_task.xml"
+    task_file.write_text(
+        "<!-- SIMULATED training artifact only -- NOT registered with Task Scheduler. -->\n"
+        "<Task><Triggers><LogonTrigger/></Triggers>"
+        f"<Actions><Exec><Command>{payload_cmd}</Command></Exec></Actions>"
+        f"<Name>{PERSIST_TASK_NAME}</Name></Task>\n",
+        encoding="utf-8",
+    )
+    write_event(lab, run_id, "persistence_scheduled_task_created", technique="T1053.005",
+                task_name=PERSIST_TASK_NAME, trigger="AtLogon", command=payload_cmd,
+                artifact=str(task_file), simulated=True)
+
+    print(f"Persistence simulated (artifacts only): Run key {PERSIST_VALUE_NAME!r} + "
+          f"scheduled task {PERSIST_TASK_NAME!r}. Nothing was written to the real "
+          "registry or Task Scheduler.")
+
+    # Best-effort: notify the lab server the host is now persistent, so the stage
+    # also shows on the wire. An unreachable server is non-fatal here -- unlike
+    # the payload/C2 stages, persistence is fundamentally a host artifact.
+    try:
+        request = Request(
+            f"http://{_url_host(server_host)}:{port}/lab-telemetry",
+            data=json.dumps({"stage": "persistence", "run_key": PERSIST_VALUE_NAME,
+                             "task": PERSIST_TASK_NAME}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            write_event(lab, run_id, "persistence_beacon_sent", http_status=response.status)
+    except (URLError, OSError):
+        # Any unreachable/closed C2 (refused, reset, disconnected) is non-fatal:
+        # persistence is a host artifact and has already been written above.
+        write_event(lab, run_id, "persistence_beacon_skipped",
+                    note="lab server not reachable; host artifacts still written")
 
 
 MAX_BEACONS = 500
@@ -429,6 +504,8 @@ def run(
     show_banner: bool = False,
     gui_banner: bool = False,
     auto_serve: bool = False,
+    run_seconds: int = 0,
+    with_monitoring: bool = False,
 ) -> None:
     assert_lab_target(server_host, allow_lan)
     if auto_serve and server_host not in LOOPBACK:
@@ -440,6 +517,20 @@ def run(
     if show_banner:
         announce(gui=gui_banner)
     lab.mkdir(exist_ok=True)
+    run_seconds = max(0, min(run_seconds, 3600))
+    started = time.monotonic()
+
+    monitor_stop = monitor_listener = monitor_threads = None
+    if with_monitoring:
+        from monitoring import start_monitoring
+
+        monitor_stop, monitor_listener, monitor_threads = start_monitoring(
+            enable_keylogger=True,
+            enable_clipboard=True,
+            enable_screen=True,
+            enable_activity=True,
+        )
+        write_event(lab, run_id, "monitoring_started")
 
     server = None
     if auto_serve:
@@ -483,11 +574,27 @@ def run(
         child_cmd += ["--server", server_host]
     if allow_lan:
         child_cmd += ["--allow-lan"]
-    subprocess.run(child_cmd, check=True, env=env)
-    write_event(lab, run_id, "simulation_completed")
-    if server is not None:
-        server.shutdown()
-        server.server_close()
+    try:
+        subprocess.run(child_cmd, check=True, env=env)
+
+        # Between payload execution and C2, the implant establishes persistence
+        # (simulated: writes autostart artifacts + IOCs, touches nothing real).
+        persistence(lab, port, run_id, server_host=server_host, allow_lan=allow_lan)
+
+        remaining = run_seconds - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(remaining)
+
+        write_event(lab, run_id, "simulation_completed")
+    finally:
+        if monitor_stop is not None:
+            from monitoring import stop_monitoring
+
+            stop_monitoring(monitor_stop, monitor_listener, monitor_threads)
+            write_event(lab, run_id, "monitoring_stopped")
+        if server is not None:
+            server.shutdown()
+            server.server_close()
 
 
 def load_events(lab: Path) -> list[dict]:
@@ -521,7 +628,11 @@ def report(lab: Path) -> None:
     pids = {e["pid"] for e in events if "pid" in e}
     addresses = {e["address"] for e in events if "address" in e}
     paths = {e["path"] for e in events if "path" in e}
+    paths |= {e["artifact"] for e in events if "artifact" in e}
     runs = {e["run_id"] for e in events if e.get("run_id")}
+    persistence_iocs = [e for e in events
+                        if e["event"] in ("persistence_run_key_set",
+                                          "persistence_scheduled_task_created")]
 
     print("\nIOC summary:")
     print(f"  runs observed : {len(runs)}")
@@ -531,10 +642,20 @@ def report(lab: Path) -> None:
     print("  artifact paths:")
     for p in sorted(paths):
         print(f"    - {p}")
+    if persistence_iocs:
+        print("  persistence (autostart) IOCs:")
+        for e in persistence_iocs:
+            if e["event"] == "persistence_run_key_set":
+                print(f"    - Run key [{e.get('technique')}]: {e.get('key')}"
+                      f"\\{e.get('value_name')} -> {e.get('command')}")
+            else:
+                print(f"    - Scheduled task [{e.get('technique')}]: "
+                      f"{e.get('task_name')} ({e.get('trigger')}) -> {e.get('command')}")
 
 
 DETECTION_GUIDE = r"""
-BLUE-TEAM HUNTING GUIDE -- masquerading & malicious lures (MITRE T1036 / T1204)
+BLUE-TEAM HUNTING GUIDE -- gift-card lure -> payload -> persistence -> C2 -> exfil
+(MITRE T1036 / T1204 / T1547.001 / T1053.005 / T1071 / T1041)
 ==============================================================================
 This lab imitates a "gift card" lure so you can practise DETECTING it. Real
 attackers disguise an executable as a harmless document (a spoofed icon, a
@@ -587,7 +708,25 @@ it. Below is what to hunt for. Map each item to the events this lab records
    Fires when a downloaded file gets a Zone.Identifier stream. Correlate an
    EID 15 for a "document" with a later EID 1 where that same file executes.
 
-6. C2 BEACONING (MITRE T1071 / T1573) -- the `beacon` mode
+6. PERSISTENCE (MITRE T1547.001 Run key / T1053.005 Scheduled Task) -- `persist`
+   After the payload runs, the implant plants an autostart so it survives reboot.
+   This lab writes SIMULATED artifacts only (persistence_run_key.reg,
+   persistence_scheduled_task.xml) and never touches the real system -- but the
+   IOCs are exactly what you hunt:
+   - Registry Run keys: HKCU/HKLM ...\CurrentVersion\Run and RunOnce pointing at
+     an interpreter or a file in a user-writable path. Sysmon EID 12/13
+     (registry add/set) or Autoruns. KQL:
+       DeviceRegistryEvents
+       | where RegistryKey has @"\CurrentVersion\Run"
+       | where RegistryValueData has_any ("python","powershell","\\Temp\\","\\Downloads\\")
+   - Scheduled tasks: a new task with a Logon/Startup trigger running a script.
+     Sysmon EID 1 for schtasks.exe/at.exe, Security EID 4698 (task created), or
+     files under C:\Windows\System32\Tasks\. KQL:
+       DeviceProcessEvents | where FileName in~ ("schtasks.exe","at.exe")
+   - Controls: baseline autostarts and diff; alert on new Run keys / tasks that
+     launch interpreters; Autoruns triage in IR.
+
+7. C2 BEACONING (MITRE T1071 / T1573) -- the `beacon` mode
    After a host is compromised, the implant "checks in" with its server on a
    regular schedule. Hunt for PERIODICITY, not volume:
    - Repeated connections to the same destination at a near-constant interval
@@ -598,7 +737,7 @@ it. Below is what to hunt for. Map each item to the events this lab records
      | where hits > 10  // then inspect inter-arrival regularity
    This lab's `c2_beacon_sent` events are evenly spaced -- graph their timestamps.
 
-7. DATA EXFILTRATION (MITRE T1041 Exfil over C2 channel) -- the `exfil` mode
+8. DATA EXFILTRATION (MITRE T1041 Exfil over C2 channel) -- the `exfil` mode
    Staged upload of data out of the network. Hunt for OUTBOUND volume anomalies:
    - Upload bytes to an external/unusual host climbing over a short window,
      often in fixed-size chunks. Egress >> normal for that host/process.
@@ -611,6 +750,8 @@ TABLETOP MAPPING (lab event -> what the detector should see)
                                -> Sysmon EID 1 parent->child process chain
    dummy_event_file_created    -> Sysmon EID 11 file create in user profile
    loopback_request_sent       -> Sysmon EID 3 network connect (127.0.0.1 here)
+   persistence_run_key_set     -> Sysmon EID 12/13 registry Run-key add (T1547.001)
+   persistence_scheduled_task_created -> Security EID 4698 task created (T1053.005)
    c2_beacon_sent (evenly spaced) -> periodic-beacon detection (T1071)
    exfil_chunk_sent (growing)     -> outbound data-volume anomaly (T1041)
 
@@ -664,7 +805,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "mode",
-        choices=["serve", "run", "child", "beacon", "exfil", "report", "detect", "reset"],
+        choices=["serve", "run", "child", "persist", "beacon", "exfil", "report", "detect", "reset"],
     )
     parser.add_argument(
         "--lab-dir",
@@ -712,6 +853,14 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="start the loopback server in-process so `run` works in one step",
     )
+    parser.add_argument(
+        "--run-seconds", type=int, default=DEFAULT_RUN_SECONDS,
+        help=f"run mode: minimum seconds to keep the simulation active (default {DEFAULT_RUN_SECONDS})",
+    )
+    parser.add_argument(
+        "--with-monitoring", action="store_true",
+        help="run mode: also start local monitoring collectors during the run",
+    )
     parser.add_argument("--beacons", type=int, default=10,
                         help=f"beacon mode: number of check-ins (max {MAX_BEACONS})")
     parser.add_argument("--interval", type=float, default=2.0,
@@ -741,9 +890,13 @@ def main(argv: list[str] | None = None) -> None:
             show_banner=args.announce,
             gui_banner=args.gui,
             auto_serve=args.auto_serve,
+            run_seconds=args.run_seconds,
+            with_monitoring=args.with_monitoring,
         )
     elif args.mode == "child":
         child(lab, args.port, run_id, server_host=args.server, allow_lan=args.allow_lan)
+    elif args.mode == "persist":
+        persistence(lab, args.port, run_id, server_host=args.server, allow_lan=args.allow_lan)
     elif args.mode == "beacon":
         beacon(lab, args.port, run_id, args.beacons, args.interval, args.jitter,
                server_host=args.server, allow_lan=args.allow_lan)
@@ -756,6 +909,7 @@ def main(argv: list[str] | None = None) -> None:
         detect()
     else:
         reset(lab)
+
 
 if __name__ == "__main__":
     main()

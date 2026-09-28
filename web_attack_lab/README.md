@@ -14,6 +14,8 @@ Requires Python 3.9+ (no packages).
 py web_attack_lab.py run --announce --attack credstuff
 py web_attack_lab.py run --announce --attack enum
 py web_attack_lab.py run --announce --attack inject
+py web_attack_lab.py run --announce --attack ssrf
+py web_attack_lab.py run --announce --attack traversal
 py web_attack_lab.py run --announce --attack portscan
 ```
 
@@ -34,7 +36,7 @@ Across VMs (private lab only): `serve --allow-lan --bind 0.0.0.0` on the victim,
 
 ```powershell
 py web_attack_lab.py report   # timeline + signature summary (answer key)
-py web_attack_lab.py detect   # blue-team hunting guide (T1110 / T1595 / T1190)
+py web_attack_lab.py detect   # hunting guide (T1110/T1595/T1190/T1083/T1552.005)
 py web_attack_lab.py reset    # wipe the lab dir
 ```
 
@@ -44,14 +46,16 @@ py web_attack_lab.py reset    # wipe the lab dir
 | --- | --- | --- |
 | `credstuff` | T1110 | 401 burst, many **usernames**, one endpoint (`/login`); one 200 = a hit |
 | `enum` | T1595 | 404 burst across many **distinct paths**; a few 200s reveal real content |
-| `inject` | T1190 | request params carry SQLi/XSS/traversal markers (**logged, not run**) |
+| `inject` | T1190 | request params carry SQLi/XSS markers (**logged, not run**) |
+| `ssrf` | T1190 / T1552.005 | URL param aimed at `169.254.169.254`/metadata/`file://` (**logged, never fetched**) |
+| `traversal` | T1083 / T1190 | file param with `../` / encoded variants reaching `/etc/passwd` (**logged, never opened**) |
 | `portscan` | T1595.001 | one source touches **many ports** in a short window |
 
 ## Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--attack NAME` | `credstuff` | `credstuff`, `enum`, `inject`, `portscan` |
+| `--attack NAME` | `credstuff` | `credstuff`, `enum`, `inject`, `ssrf`, `traversal`, `portscan` |
 | `--port N` | `8770` | Victim web port (sensor ports are `N+1..N+16`) |
 | `--bind HOST` | `127.0.0.1` | Victim listen address (`serve`); LAN IP/`0.0.0.0` needs `--allow-lan` |
 | `--target HOST` | `127.0.0.1` | Address to attack (`attack`); private/lab host, needs `--allow-lan` |

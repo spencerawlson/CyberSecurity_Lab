@@ -46,6 +46,8 @@ DEFAULT_FACTOR = 50          # response = factor x query (capped)
 MAX_RESPONSE_BYTES = 60_000  # keep the reflector's answer lab-sized
 DEFAULT_QUERIES = 200
 MAX_QUERIES = 20_000
+DEFAULT_DURATION = 60
+MAX_DURATION = 600
 QUERY = b"AMPLIFY?\n"        # the tiny request that provokes a big answer
 
 RUN_ID_ENV = "AMP_LAB_RUN_ID"
@@ -55,6 +57,37 @@ PORT_ENV = "AMP_LAB_PORT"
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
 BIND_ANY = ("0.0.0.0", "::")
+
+# Named reflector profiles. Each pairs a small, protocol-flavoured query with a
+# realistic amplification factor and the UDP source port a real reflector would
+# answer from, so a learner can measure how the factor and query signature differ
+# by protocol. The bytes are representative (this is a concept lab, not a wire
+# fuzzer); nothing here speaks the real protocol or reaches a real service.
+# NOTE: responses are still capped at MAX_RESPONSE_BYTES, so very high-factor
+# profiles (memcached) measure lower here than in the wild -- that cap is the
+# point (a lab-sized answer), and `detect` states the real-world numbers.
+PROFILES: dict[str, dict] = {
+    "generic": {"query": QUERY, "factor": DEFAULT_FACTOR, "sport": DEFAULT_PORT,
+                "real": "configurable", "desc": "generic small-query/large-response reflector"},
+    "dns": {"query": b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+                     b"\x03isc\x03org\x00\x00\xff\x00\x01",
+            "factor": 54, "sport": 53, "real": "~28-54x",
+            "desc": "DNS ANY query to an open resolver"},
+    "ntp": {"query": b"\x17\x00\x03\x2a\x00\x00\x00\x00",
+            "factor": 556, "sport": 123, "real": "~556x",
+            "desc": "NTP monlist (MON_GETLIST_1) request"},
+    "ssdp": {"query": b"M-SEARCH * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\n"
+                      b"MAN:\"ssdp:discover\"\r\nMX:2\r\nST:ssdp:all\r\n\r\n",
+             "factor": 30, "sport": 1900, "real": "~30x",
+             "desc": "SSDP/UPnP M-SEARCH discovery"},
+    "memcached": {"query": b"\x00\x01\x00\x00\x00\x01\x00\x00stats\r\n",
+                  "factor": 10000, "sport": 11211, "real": "~10,000-50,000x",
+                  "desc": "memcached UDP stats"},
+}
+
+
+def _profile(name: str) -> dict:
+    return PROFILES.get(name, PROFILES["generic"])
 
 
 def timestamp() -> str:
@@ -135,8 +168,9 @@ def write_event(lab: Path, run_id: str, event: str, **details) -> dict:
 
 
 def _reflector_loop(sock: socket.socket, factor: int, stop: threading.Event,
-                    stats: dict, lock: threading.Lock) -> None:
-    resp_size = min(MAX_RESPONSE_BYTES, max(1, factor) * len(QUERY))
+                    stats: dict, lock: threading.Lock,
+                    query: bytes = QUERY) -> None:
+    resp_size = min(MAX_RESPONSE_BYTES, max(1, factor) * len(query))
     response = b"R" * resp_size
     while not stop.is_set():
         try:
@@ -166,17 +200,23 @@ def _make_reflector(port: int, factor: int, bind_host: str, allow_lan: bool):
 
 
 def serve(lab: Path, port: int, run_id: str, factor: int,
-          bind_host: str = HOST, allow_lan: bool = False) -> None:
+          bind_host: str = HOST, allow_lan: bool = False,
+          profile: str = "generic") -> None:
+    prof = _profile(profile)
+    query = prof["query"]
+    if profile != "generic":
+        factor = prof["factor"]  # a named profile fixes its realistic factor
     sock = _make_reflector(port, factor, bind_host, allow_lan)
     stop = threading.Event()
     stats = {"queries": 0, "bytes_in": 0, "bytes_out": 0}
     lock = threading.Lock()
-    threading.Thread(target=_reflector_loop, args=(sock, factor, stop, stats, lock),
+    threading.Thread(target=_reflector_loop, args=(sock, factor, stop, stats, lock, query),
                      daemon=True).start()
     scope = "loopback only" if bind_host in LOOPBACK else "private lab network"
     write_event(lab, run_id, "reflector_started", address=f"{bind_host}:{port}",
-                factor=factor)
-    print(f"UDP reflector on {bind_host}:{port} (~{factor}x, {scope}). Ctrl+C to stop.")
+                factor=factor, profile=profile)
+    print(f"UDP reflector on {bind_host}:{port} (profile={profile}, ~{factor}x, {scope}). "
+          "Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1.0)
@@ -194,32 +234,53 @@ def serve(lab: Path, port: int, run_id: str, factor: int,
 
 
 def reflect(lab: Path, port: int, run_id: str, queries: int,
-            target_host: str = HOST, allow_lan: bool = False) -> dict:
+            duration: int = 0,
+            target_host: str = HOST, allow_lan: bool = False,
+            profile: str = "generic") -> dict:
     assert_lab_target(target_host, allow_lan)
     queries = max(1, min(queries, MAX_QUERIES))
+    duration = max(0, min(duration, MAX_DURATION))
+    query = _profile(profile)["query"]
     scope = "loopback only" if target_host in LOOPBACK else "private lab network"
     write_event(lab, run_id, "reflect_started", queries=queries,
-                target=f"{target_host}:{port}")
-    print(f"Sending {queries} small queries to reflector {target_host}:{port} ({scope}).")
+                duration_s=duration, target=f"{target_host}:{port}", profile=profile)
+    if duration > 0:
+        print(f"Sending small queries to reflector {target_host}:{port} for {duration}s ({scope}).")
+    else:
+        print(f"Sending {queries} small queries to reflector {target_host}:{port} ({scope}).")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(2.0)
-    sent_bytes = recv_bytes = answered = 0
-    for _ in range(queries):
-        try:
-            sock.sendto(QUERY, (target_host, port))
-            sent_bytes += len(QUERY)
-            data, _addr = sock.recvfrom(65535)
-            recv_bytes += len(data)
-            answered += 1
-        except OSError:
-            continue
+    sent_bytes = recv_bytes = answered = sent_queries = 0
+    if duration > 0:
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            try:
+                sock.sendto(query, (target_host, port))
+                sent_bytes += len(query)
+                sent_queries += 1
+                data, _addr = sock.recvfrom(65535)
+                recv_bytes += len(data)
+                answered += 1
+            except OSError:
+                continue
+    else:
+        for _ in range(queries):
+            try:
+                sock.sendto(query, (target_host, port))
+                sent_bytes += len(query)
+                sent_queries += 1
+                data, _addr = sock.recvfrom(65535)
+                recv_bytes += len(data)
+                answered += 1
+            except OSError:
+                continue
     sock.close()
 
     factor = round(recv_bytes / sent_bytes, 2) if sent_bytes else 0.0
-    result = {"queries_sent": queries, "answered": answered,
+    result = {"queries_sent": sent_queries, "answered": answered,
               "bytes_sent": sent_bytes, "bytes_received": recv_bytes,
-              "amplification_factor": factor}
+              "amplification_factor": factor, "profile": profile}
     write_event(lab, run_id, "reflect_completed", **result)
     print(f"Amplification: {sent_bytes} B out -> {recv_bytes} B back "
           f"= {factor}x (this all returned to YOU; no spoofing).")
@@ -227,19 +288,25 @@ def reflect(lab: Path, port: int, run_id: str, queries: int,
 
 
 def run(lab: Path, port: int, run_id: str, factor: int, queries: int,
-        show_banner: bool = False) -> None:
+        duration: int = 0,
+        show_banner: bool = False, profile: str = "generic") -> None:
     if show_banner:
         announce()
     lab.mkdir(exist_ok=True)
+    prof = _profile(profile)
+    query = prof["query"]
+    if profile != "generic":
+        factor = prof["factor"]
     sock = _make_reflector(port, factor, HOST, False)
     stop = threading.Event()
     stats = {"queries": 0, "bytes_in": 0, "bytes_out": 0}
     lock = threading.Lock()
-    threading.Thread(target=_reflector_loop, args=(sock, factor, stop, stats, lock),
+    threading.Thread(target=_reflector_loop, args=(sock, factor, stop, stats, lock, query),
                      daemon=True).start()
-    write_event(lab, run_id, "reflector_started", address=f"{HOST}:{port}", factor=factor)
+    write_event(lab, run_id, "reflector_started", address=f"{HOST}:{port}",
+                factor=factor, profile=profile)
     time.sleep(0.5)
-    result = reflect(lab, port, run_id, queries)
+    result = reflect(lab, port, run_id, queries, duration, profile=profile)
     stop.set()
     sock.close()
     write_event(lab, run_id, "simulation_completed", **result)
@@ -281,6 +348,7 @@ def report(lab: Path) -> None:
                  if e["event"] in ("reflect_completed", "simulation_completed")), None)
     print("\nAmplification summary:")
     if done:
+        print(f"  profile             : {done.get('profile', 'generic')}")
         print(f"  queries sent        : {done.get('queries_sent', 0)}")
         print(f"  bytes sent          : {done.get('bytes_sent', 0)}")
         print(f"  bytes received      : {done.get('bytes_received', 0)}")
@@ -302,6 +370,17 @@ WHY IT'S DANGEROUS IN THE WILD
      DNS, NTP monlist, memcached, SSDP, CLDAP...) with the victim's IP forged as
      the source. Each reflector answers the victim with a much larger packet.
    - Amplification factors: DNS ~28-54x, NTP ~556x, memcached ~10,000-50,000x.
+
+PROFILES IN THIS LAB (pick with --profile; each has its own query + factor)
+   profile     UDP src port   query signature            typical real factor
+   generic     8769           "AMPLIFY?"                 configurable
+   dns         53             DNS ANY (e.g. isc.org)     ~28-54x
+   ntp         123            monlist (MON_GETLIST_1)    ~556x
+   ssdp        1900           M-SEARCH ssdp:discover     ~30x
+   memcached   11211          "stats\r\n"                ~10,000-50,000x
+   The lab caps each response at MAX_RESPONSE_BYTES, so memcached MEASURES lower
+   here than in the wild -- the cap keeps the drill lab-sized; the real factor is
+   the number above. What stays faithful is the query-signature-per-source-port.
 
 DETECTION (as the VICTIM)
    - Large inbound UDP from source ports 53/123/1900/11211 you never queried.
@@ -330,6 +409,7 @@ MITIGATIONS
    - Upstream scrubbing / anycast absorption; rate-limit UDP by source port.
 
 TABLETOP MAPPING (lab event -> what the detector should see)
+   reflector_started (profile)  -> which service/source-port to watch for abuse
    reflector_started / _stopped -> the amplifier's bytes_in vs bytes_out ratio
    reflect_completed            -> the amplification_factor you measured
 """
@@ -366,9 +446,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get(PORT_ENV, DEFAULT_PORT)))
     parser.add_argument("--factor", type=int, default=DEFAULT_FACTOR,
-                        help=f"response-to-query size ratio (default {DEFAULT_FACTOR})")
+                        help=f"response-to-query size ratio for the generic profile "
+                             f"(default {DEFAULT_FACTOR}); named profiles set their own")
+    parser.add_argument("--profile", choices=list(PROFILES), default="generic",
+                        help="reflector protocol profile: generic, dns, ntp, ssdp, "
+                             "memcached (sets a realistic query + factor)")
     parser.add_argument("--queries", type=int, default=DEFAULT_QUERIES,
                         help=f"queries to send (default {DEFAULT_QUERIES}, max {MAX_QUERIES})")
+    parser.add_argument("--duration", type=int, default=DEFAULT_DURATION,
+                        help=f"seconds to run reflect traffic (default {DEFAULT_DURATION}, max {MAX_DURATION})")
     parser.add_argument("--bind", default=HOST,
                         help="reflector listen address (serve); LAN IP/0.0.0.0 needs --allow-lan")
     parser.add_argument("--target", default=HOST,
@@ -382,11 +468,14 @@ def main(argv: list[str] | None = None) -> None:
     run_id = os.environ.get(RUN_ID_ENV) or uuid.uuid4().hex
 
     if args.mode == "serve":
-        serve(lab, args.port, run_id, args.factor, bind_host=args.bind, allow_lan=args.allow_lan)
+        serve(lab, args.port, run_id, args.factor, bind_host=args.bind,
+              allow_lan=args.allow_lan, profile=args.profile)
     elif args.mode == "reflect":
-        reflect(lab, args.port, run_id, args.queries, target_host=args.target, allow_lan=args.allow_lan)
+        reflect(lab, args.port, run_id, args.queries, args.duration,
+                target_host=args.target, allow_lan=args.allow_lan, profile=args.profile)
     elif args.mode == "run":
-        run(lab, args.port, run_id, args.factor, args.queries, show_banner=args.announce)
+        run(lab, args.port, run_id, args.factor, args.queries, args.duration,
+            show_banner=args.announce, profile=args.profile)
     elif args.mode == "report":
         report(lab)
     elif args.mode == "detect":

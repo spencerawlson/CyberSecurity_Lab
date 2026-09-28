@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
+.venv/
 gift_card_ir_lab/
+log.txt
+screenshots/

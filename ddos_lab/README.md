@@ -40,6 +40,7 @@ py ddos_sim.py run --announce --attack slowread     # slow-rate: reads response 
 py ddos_sim.py run --announce --attack cachebust    # volumetric: every URL unique
 py ddos_sim.py run --announce --attack connflood    # connection churn (fresh socket each)
 py ddos_sim.py run --announce --attack bodyflood    # bandwidth: large POST bodies
+py ddos_sim.py run --announce --attack rapidreset   # HTTP/2 rapid reset (CVE-2023-44487)
 ```
 
 | Attack | Signature at the victim |
@@ -48,6 +49,7 @@ py ddos_sim.py run --announce --attack bodyflood    # bandwidth: large POST bodi
 | `cachebust` | high **unique-URL** count — cache/CDN can't absorb it |
 | `connflood` | connections ≈ requests (fresh socket each) — accept-queue exhaustion |
 | `bodyflood` | inbound **bytes** spike — bandwidth exhaustion |
+| `rapidreset` | **aborted connections** spike; streams opened then cancelled, few complete (CVE-2023-44487) |
 | `slowloris` | concurrency climbs, requests never complete (held headers) |
 | `rudy` | concurrency climbs, held POST body |
 | `slowread` | completes request, then drains response at a trickle |
@@ -126,7 +128,7 @@ Everything stays on `127.0.0.1`.
 | `--bind HOST` | `127.0.0.1` | Address the victim listens on (`serve`); use a LAN IP or `0.0.0.0` with `--allow-lan` |
 | `--target HOST` | `127.0.0.1` | Address to send load to (`flood`); a private/lab host, needs `--allow-lan` |
 | `--allow-lan` | off | Permit binding/targeting your **private** lab network; public addresses are always refused |
-| `--attack NAME` | `volumetric` | Attack style: `volumetric`, `cachebust`, `connflood`, `bodyflood`, `slowloris`, `rudy`, `slowread` |
+| `--attack NAME` | `volumetric` | Attack style: `volumetric`, `cachebust`, `connflood`, `bodyflood`, `rapidreset`, `slowloris`, `rudy`, `slowread` |
 | `--workers N` | `50` | Simulated attacker workers (max `256`) |
 | `--duration N` | `10` | Seconds to generate load (max `300`) |
 | `--alert-rps N` | `100` | Requests/sec that fires the mock volumetric alert |

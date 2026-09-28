@@ -21,6 +21,29 @@ py amp_lab.py run --announce --factor 100 --queries 200
 Starts the reflector in-process, sends small queries, and reports how many bytes
 came back per byte sent (the amplification factor).
 
+### Protocol profiles
+
+Pick a real-world reflector shape with `--profile`; each sets its own query
+signature, UDP source port, and realistic factor:
+
+```powershell
+py amp_lab.py run --announce --profile ntp        # NTP monlist (~556x)
+py amp_lab.py run --announce --profile ssdp       # SSDP M-SEARCH (~30x)
+py amp_lab.py run --announce --profile dns        # DNS ANY (~28-54x)
+py amp_lab.py run --announce --profile memcached  # memcached stats (capped here)
+```
+
+| Profile | UDP src port | Query | Typical real factor |
+| --- | --- | --- | --- |
+| `generic` | 8769 | `AMPLIFY?` | configurable (`--factor`) |
+| `dns` | 53 | DNS ANY | ~28–54× |
+| `ntp` | 123 | `monlist` | ~556× |
+| `ssdp` | 1900 | `M-SEARCH` | ~30× |
+| `memcached` | 11211 | `stats` | ~10,000–50,000× |
+
+Responses are capped at ~60 KB, so `memcached` **measures** lower here than in the
+wild — the cap keeps the drill lab-sized; `detect` states the real numbers.
+
 ## Two-window / cross-host
 
 ```powershell
@@ -51,7 +74,8 @@ and shutting down open amplifiers.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--factor N` | `50` | Response-to-query size ratio (capped at ~60 KB response) |
+| `--factor N` | `50` | Response-to-query size ratio for `generic` (capped at ~60 KB); named profiles set their own |
+| `--profile NAME` | `generic` | Reflector protocol: `generic`, `dns`, `ntp`, `ssdp`, `memcached` |
 | `--queries N` | `200` | Queries to send (max `20000`) |
 | `--port N` | `8769` | UDP port for the reflector |
 | `--bind HOST` | `127.0.0.1` | Reflector listen address (`serve`); LAN IP/`0.0.0.0` needs `--allow-lan` |

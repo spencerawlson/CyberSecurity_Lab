@@ -19,12 +19,21 @@ leaves behind so a defender can practise **detecting** it. They are deliberately
   loopback). **Any public/routable address is refused.**
 - There is **no source-IP spoofing** anywhere; simulated "attacker" IPs are just
   text tags drawn from the RFC 5737 documentation ranges (e.g. `203.0.113.0/24`).
-- The "malware" writes only **clearly-labelled dummy files**; the "keylogger"
-  never reads a keyboard; injection payloads are **logged, never executed**;
-  worker counts, durations, and response sizes are **hard-capped**.
+- The "malware" writes only **clearly-labelled dummy files**, and the simulated
+  payload's "keylogger" never reads a keyboard — it writes fixed `TEST_*` events;
+  injection payloads are **logged, never executed**; worker counts, durations,
+  and response sizes are **hard-capped**.
 - Every step is appended to an `events.jsonl` **answer key** in the lab
   directory, and each lab has a built-in `report` (timeline + IOCs) and `detect`
   (hunting guidance) command.
+
+> **One opt-in exception.** The gift-card lab's `--with-monitoring` flag runs
+> real *local* host-telemetry collectors (keystrokes, clipboard, periodic
+> screenshots, and the process / active-window list) so you can generate genuine
+> endpoint telemetry to hunt. It is **off by default**, stays on the local
+> machine (it sends nothing off the box), and is documented in
+> `gift_card_lab/README.md`. Use it only on a machine you own or are authorized
+> to test.
 
 The goal is always the same: **run a scenario with your detection tooling armed,
 then compare what your tools caught against the lab's own answer key.**
@@ -67,7 +76,7 @@ real engagement.
 
 | Need | Detail |
 | --- | --- |
-| Python | 3.9+ (standard library only — nothing to `pip install`) |
+| Python | 3.9+ — the core labs use the **standard library only** (nothing to `pip install`); only the gift-card lab's optional `--with-monitoring` needs `pip install -r gift_card_lab/requirements.txt` |
 | OS for host telemetry | Windows 10/11 for **Sysmon** and **Procmon** |
 | OS for `tcpdump` | Linux/macOS (or WSL) |
 | Cross-platform | **Wireshark** works on Windows/Linux/macOS |

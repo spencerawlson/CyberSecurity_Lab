@@ -53,9 +53,12 @@ SENSOR_PORTS = 16  # extra TCP ports the victim opens so a scan has targets
 MAX_WORKERS = 128
 MAX_DURATION = 120
 DEFAULT_WORKERS = 20
+DEFAULT_DURATION = 60
 DEFAULT_ALERT_401 = 25   # failed logins/sec that fires the brute-force alert
 DEFAULT_ALERT_404 = 25   # 404s/sec that fires the enumeration alert
 DEFAULT_ALERT_SCAN = 8   # distinct ports one source touches -> scan alert
+DEFAULT_ALERT_SSRF = 3   # cumulative SSRF probes that fire the SSRF alert
+DEFAULT_ALERT_TRAVERSAL = 3  # cumulative traversal probes that fire the alert
 MAX_BODY_BYTES = 64 * 1024
 SET_CAP = 200_000
 
@@ -73,8 +76,19 @@ REAL_PATHS = {"/", "/login", "/dashboard", "/api/health", "/robots.txt", "/favic
 VALID_CREDS = {"admin": "S3cure-Lab-Pw!"}  # one valid pair; stuffing mostly fails
 
 # Obvious attack payload markers the victim LOGS (never executes).
-INJECTION_MARKERS = ("' or ", "\" or ", "union select", "<script", "../", "; drop ",
+INJECTION_MARKERS = ("' or ", "\" or ", "union select", "<script", "; drop ",
                      "onerror=", "sleep(", "|| ", "&&", "%27")
+
+# Server-Side Request Forgery markers: internal/link-local/cloud-metadata targets
+# and dangerous URL schemes. The victim LOGS these; it NEVER fetches the URL.
+SSRF_MARKERS = ("169.254.169.254", "metadata.google", "100.100.100.200",
+                "http://127.0.0.1", "http://localhost", "http://[::1]",
+                "http://0.0.0.0", "file://", "gopher://", "dict://")
+
+# Path-traversal markers, including the once-decoded forms of encoded variants
+# (the victim decodes input once before matching, exactly like a WAF would).
+TRAVERSAL_MARKERS = ("../", "..\\", "%2e%2e", "..%2f", "..%5c",
+                     "/etc/passwd", "/windows/win.ini", "boot.ini")
 
 
 def timestamp() -> str:
@@ -173,6 +187,8 @@ class Metrics:
         self.usernames: set[str] = set()
         self.paths: set[str] = set()
         self.injections = 0
+        self.ssrf = 0
+        self.traversal = 0
         self.scan_map: dict[str, set[int]] = collections.defaultdict(set)
         self.peak_401_rps = 0
         self.peak_404_rps = 0
@@ -181,7 +197,8 @@ class Metrics:
         return int(time.monotonic() - self.start)
 
     def on_request(self, status: int, path: str, username: str | None,
-                   injection: bool) -> None:
+                   injection: bool, ssrf: bool = False,
+                   traversal: bool = False) -> None:
         with self.lock:
             self.total_requests += 1
             self.status_counts[status] += 1
@@ -195,6 +212,10 @@ class Metrics:
                 self.usernames.add(username)
             if injection:
                 self.injections += 1
+            if ssrf:
+                self.ssrf += 1
+            if traversal:
+                self.traversal += 1
 
     def on_port_connect(self, source: str, port: int) -> int:
         with self.lock:
@@ -213,6 +234,8 @@ class Metrics:
                 "unique_usernames": len(self.usernames),
                 "unique_paths": len(self.paths),
                 "injection_probes": self.injections,
+                "ssrf_probes": self.ssrf,
+                "traversal_probes": self.traversal,
                 "peak_401_rps": self.peak_401_rps,
                 "peak_404_rps": self.peak_404_rps,
                 "widest_port_scan": widest_scan,
@@ -241,10 +264,18 @@ def make_handler(metrics: Metrics):
         def _path_only(self) -> str:
             return self.path.split("?", 1)[0]
 
+        def _decoded(self) -> str:
+            # A WAF inspects DECODED input, so decode once before matching.
+            return unquote(self.path).lower()
+
         def _has_injection(self) -> bool:
-            # A WAF inspects DECODED input, so decode before matching.
-            low = unquote(self.path).lower()
-            return any(m in low for m in INJECTION_MARKERS)
+            return any(m in self._decoded() for m in INJECTION_MARKERS)
+
+        def _has_ssrf(self) -> bool:
+            return any(m in self._decoded() for m in SSRF_MARKERS)
+
+        def _has_traversal(self) -> bool:
+            return any(m in self._decoded() for m in TRAVERSAL_MARKERS)
 
         def do_GET(self):  # noqa: N802
             path = self._path_only()
@@ -253,9 +284,14 @@ def make_handler(metrics: Metrics):
                            "application/json")
                 return
             injection = self._has_injection()
-            if injection:
-                metrics.on_request(200, path, None, True)
-                self._send(200, b"query received (logged, not executed)\n")
+            ssrf = self._has_ssrf()
+            traversal = self._has_traversal()
+            if injection or ssrf or traversal:
+                # Recorded as an answer-key signal. The URL is NEVER fetched and
+                # the payload is NEVER evaluated -- the victim only logs it.
+                metrics.on_request(200, path, None, injection,
+                                   ssrf=ssrf, traversal=traversal)
+                self._send(200, b"query received (logged, not executed or fetched)\n")
                 return
             if path in REAL_PATHS:
                 status = 200
@@ -288,7 +324,8 @@ def make_handler(metrics: Metrics):
                 metrics.on_request(status, path, user or None, False)
                 self._send(status, b"ok\n" if ok else b"invalid credentials\n")
                 return
-            metrics.on_request(200, path, None, self._has_injection())
+            metrics.on_request(200, path, None, self._has_injection(),
+                               ssrf=self._has_ssrf(), traversal=self._has_traversal())
             self._send(204 if path != "/login" else 200, b"")
 
         def log_message(self, *a):
@@ -339,17 +376,29 @@ def _start_sensors(base_port: int, bind_host: str, metrics: Metrics, lab: Path,
 
 def _monitor(metrics: Metrics, lab: Path, run_id: str, stop: threading.Event,
              alert_401: int, alert_404: int) -> None:
-    state = {"a401": False, "a404": False}
+    state = {"a401": False, "a404": False, "assrf": False, "atrav": False}
     while not stop.wait(1.0):
         with metrics.lock:
             sec = metrics._sec() - 1
             r401 = metrics.buckets_401.get(sec, 0)
             r404 = metrics.buckets_404.get(sec, 0)
+            ssrf_total = metrics.ssrf
+            trav_total = metrics.traversal
             metrics.peak_401_rps = max(metrics.peak_401_rps, r401)
             metrics.peak_404_rps = max(metrics.peak_404_rps, r404)
         if r401 > 0 or r404 > 0:
             write_event(lab, run_id, "traffic_window", second=sec,
                         failed_logins=r401, not_found=r404)
+        if ssrf_total >= DEFAULT_ALERT_SSRF and not state["assrf"]:
+            state["assrf"] = True
+            write_event(lab, run_id, "ssrf_probe_threshold_exceeded",
+                        ssrf_probes=ssrf_total, threshold=DEFAULT_ALERT_SSRF,
+                        note="server-side request forgery probes -> SSRF alert would fire")
+        if trav_total >= DEFAULT_ALERT_TRAVERSAL and not state["atrav"]:
+            state["atrav"] = True
+            write_event(lab, run_id, "path_traversal_threshold_exceeded",
+                        traversal_probes=trav_total, threshold=DEFAULT_ALERT_TRAVERSAL,
+                        note="path-traversal probes -> LFI/traversal alert would fire")
         if r401 >= alert_401 and not state["a401"]:
             state["a401"] = True
             write_event(lab, run_id, "auth_failure_threshold_exceeded",
@@ -416,8 +465,25 @@ WORDLIST = ["/admin", "/login", "/wp-admin", "/.git/config", "/.env", "/backup",
             "/administrator", "/cgi-bin", "/api/health", "/status", "/debug"]
 INJECT_PAYLOADS = ["/search?q=' OR '1'='1", "/search?q=1 UNION SELECT NULL--",
                    "/search?q=<script>alert(1)</script>", "/item?id=1; DROP TABLE users",
-                   "/file?path=../../../../etc/passwd", "/search?q=admin'--",
+                   "/search?q=admin'--",
                    "/api?cb=1&x=sleep(5)", "/p?u=<img src=x onerror=alert(1)>"]
+# SSRF probes point at internal / cloud-metadata targets. The victim only logs
+# them -- it never dereferences the URL, so nothing outbound ever happens.
+SSRF_PAYLOADS = ["/fetch?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                 "/proxy?target=http://127.0.0.1/admin",
+                 "/img?src=http://metadata.google.internal/computeMetadata/v1/",
+                 "/preview?url=file:///etc/passwd",
+                 "/webhook?callback=http://localhost/internal",
+                 "/fetch?url=gopher://127.0.0.1:6379/_INFO",
+                 "/load?u=http://100.100.100.200/latest/meta-data/",
+                 "/render?target=dict://127.0.0.1:11211/stats"]
+# Path-traversal probes, including encoded and mixed-slash variants.
+TRAVERSAL_PAYLOADS = ["/download?file=../../../../etc/passwd",
+                      "/download?file=..%2f..%2f..%2f..%2fetc%2fpasswd",
+                      "/view?path=....//....//....//etc/passwd",
+                      "/static?f=..\\..\\..\\windows\\win.ini",
+                      "/read?p=%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+                      "/file?name=../../../../boot.ini"]
 
 
 def _safe_path(path: str) -> str:
@@ -457,7 +523,10 @@ def credstuff(host, port, workers, rounds, source):
 
     def attempt(cred):
         u, p = cred
-        status = _http_post(host, port, "/login", f"username={u}&password={p}", source)
+        try:
+            status = _http_post(host, port, "/login", f"username={u}&password={p}", source)
+        except OSError:
+            status = 0
         with lock:
             results["attempts"] += 1
             if status == 200:
@@ -476,7 +545,10 @@ def enum(host, port, workers, rounds, source):
     lock = threading.Lock()
 
     def probe(path):
-        status = _http_get(host, port, path, source)
+        try:
+            status = _http_get(host, port, path, source)
+        except OSError:
+            status = 0
         with lock:
             results["requests"] += 1
             if status == 200:
@@ -492,9 +564,44 @@ def enum(host, port, workers, rounds, source):
 def inject(host, port, workers, rounds, source):
     payloads = INJECT_PAYLOADS * rounds
     results = {"probes_sent": len(payloads)}
+
+    def send_probe(payload):
+        try:
+            _http_get(host, port, payload, source)
+        except OSError:
+            return
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(lambda p: _http_get(host, port, p, source), payloads))
+        list(pool.map(send_probe, payloads))
     return results
+
+
+def ssrf(host, port, workers, rounds, source):
+    payloads = SSRF_PAYLOADS * rounds
+
+    def send_probe(payload):
+        try:
+            _http_get(host, port, payload, source)
+        except OSError:
+            return
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(send_probe, payloads))
+    return {"ssrf_probes_sent": len(payloads)}
+
+
+def traversal(host, port, workers, rounds, source):
+    payloads = TRAVERSAL_PAYLOADS * rounds
+
+    def send_probe(payload):
+        try:
+            _http_get(host, port, payload, source)
+        except OSError:
+            return
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(send_probe, payloads))
+    return {"traversal_probes_sent": len(payloads)}
 
 
 def portscan(host, port, source):
@@ -516,27 +623,64 @@ def portscan(host, port, source):
     return {"ports_scanned": hi - lo, "open": len(open_ports), "closed": closed}
 
 
-ATTACKS = ("credstuff", "enum", "inject", "portscan")
+ATTACKS = ("credstuff", "enum", "inject", "ssrf", "traversal", "portscan")
 
 
 def attack(lab: Path, port: int, run_id: str, kind: str, workers: int,
-           rounds: int, target_host: str = HOST, allow_lan: bool = False) -> dict:
+           rounds: int, duration: int = 0,
+           target_host: str = HOST, allow_lan: bool = False) -> dict:
     assert_lab_target(target_host, allow_lan)
     workers = max(1, min(workers, MAX_WORKERS))
     rounds = max(1, min(rounds, 50))
+    duration = max(0, min(duration, MAX_DURATION))
     scope = "loopback only" if target_host in LOOPBACK else "private lab network"
     write_event(lab, run_id, "attack_started", attack=kind, workers=workers,
-                rounds=rounds, target=f"{target_host}:{port}")
+                rounds=rounds, duration_s=duration, target=f"{target_host}:{port}")
     print(f"Generating SIMULATED {kind} against {target_host}:{port} ({scope}).")
     src = sim_source(1)
-    if kind == "credstuff":
-        result = credstuff(target_host, port, workers, rounds, src)
-    elif kind == "enum":
-        result = enum(target_host, port, workers, rounds, src)
-    elif kind == "inject":
-        result = inject(target_host, port, workers, rounds, src)
-    else:
-        result = portscan(target_host, port, src)
+
+    start = time.monotonic()
+    iterations = 0
+    result = {
+        "attempts": 0,
+        "success": 0,
+        "failed": 0,
+        "requests": 0,
+        "found_200": 0,
+        "not_found_404": 0,
+        "probes_sent": 0,
+        "ssrf_probes_sent": 0,
+        "traversal_probes_sent": 0,
+        "ports_scanned": 0,
+        "open": 0,
+        "closed": 0,
+    }
+
+    while True:
+        iterations += 1
+        if kind == "credstuff":
+            part = credstuff(target_host, port, workers, rounds, src)
+        elif kind == "enum":
+            part = enum(target_host, port, workers, rounds, src)
+        elif kind == "inject":
+            part = inject(target_host, port, workers, rounds, src)
+        elif kind == "ssrf":
+            part = ssrf(target_host, port, workers, rounds, src)
+        elif kind == "traversal":
+            part = traversal(target_host, port, workers, rounds, src)
+        else:
+            part = portscan(target_host, port, src)
+
+        for k, v in part.items():
+            result[k] = result.get(k, 0) + v
+
+        if duration <= 0:
+            break
+        if time.monotonic() - start >= duration:
+            break
+
+    result["iterations"] = iterations
+    result["elapsed_s"] = round(time.monotonic() - start, 3)
     write_event(lab, run_id, "attack_completed", attack=kind, **result)
     print(f"Attack complete: {json.dumps(result)}")
     return result
@@ -549,7 +693,7 @@ def attack(lab: Path, port: int, run_id: str, kind: str, workers: int,
 
 def run(lab: Path, port: int, run_id: str, kind: str, workers: int, rounds: int,
         alert_401: int, alert_404: int, alert_scan: int,
-        show_banner: bool = False) -> None:
+        duration: int = 0, show_banner: bool = False) -> None:
     if show_banner:
         announce()
     lab.mkdir(exist_ok=True)
@@ -564,7 +708,7 @@ def run(lab: Path, port: int, run_id: str, kind: str, workers: int, rounds: int,
                 sensor_ports=len(sensors))
     time.sleep(1.0)
 
-    attack(lab, port, run_id, kind, workers, rounds)
+    attack(lab, port, run_id, kind, workers, rounds, duration)
 
     time.sleep(1.5)
     final = metrics.snapshot()
@@ -582,6 +726,8 @@ def run(lab: Path, port: int, run_id: str, kind: str, workers: int, rounds: int,
     print(f"  unique usernames     : {final['unique_usernames']}")
     print(f"  unique paths         : {final['unique_paths']}")
     print(f"  injection probes     : {final['injection_probes']}")
+    print(f"  ssrf probes          : {final['ssrf_probes']}")
+    print(f"  traversal probes     : {final['traversal_probes']}")
     print(f"  widest port scan     : {final['widest_port_scan']} ports from one source")
     print("\nRun `report` for the timeline, `detect` for the hunting guide.")
 
@@ -633,6 +779,8 @@ def report(lab: Path) -> None:
         print(f"  unique usernames  : {final.get('unique_usernames', 0)}")
         print(f"  unique paths      : {final.get('unique_paths', 0)}")
         print(f"  injection probes  : {final.get('injection_probes', 0)}")
+        print(f"  ssrf probes       : {final.get('ssrf_probes', 0)}")
+        print(f"  traversal probes  : {final.get('traversal_probes', 0)}")
         print(f"  widest port scan  : {final.get('widest_port_scan', 0)}")
     print(f"  alerts fired      : {len(alerts)}")
     for a in alerts:
@@ -640,9 +788,10 @@ def report(lab: Path) -> None:
 
 
 DETECTION_GUIDE = r"""
-BLUE-TEAM HUNTING GUIDE -- web attacks (MITRE T1110 / T1595 / T1190)
+BLUE-TEAM HUNTING GUIDE -- web attacks
+(MITRE T1110 / T1595 / T1190 / T1083 / T1552.005)
 ====================================================================
-This lab imitates four web attacks. Map each to the recorded events (`report`)
+This lab imitates six web attacks. Map each to the recorded events (`report`)
 and confirm your tooling caught it.
 
   credstuff (T1110 Brute Force / Credential Stuffing)
@@ -651,9 +800,18 @@ and confirm your tooling caught it.
   enum (T1595 Active Scanning / dir-busting)
     Signature: burst of 404s across many DISTINCT paths from one source; a few
     200s reveal what exists. Lab metric: status_404 spike, unique_paths high.
-  inject (T1190 Exploit Public-Facing App -- SQLi/XSS/traversal probes)
+  inject (T1190 Exploit Public-Facing App -- SQLi/XSS probes)
     Signature: request parameters carrying payload markers (' OR 1=1, UNION
-    SELECT, <script>, ../). Lab metric: injection_probes > 0 (logged, never run).
+    SELECT, <script>). Lab metric: injection_probes > 0 (logged, never run).
+  ssrf (T1190 + T1552.005 Cloud Instance Metadata -- Server-Side Request Forgery)
+    Signature: a URL-valued parameter (url=, target=, src=, callback=) pointing
+    at internal/link-local hosts (169.254.169.254, metadata.google.internal,
+    127.0.0.1) or odd schemes (file://, gopher://, dict://). Lab metric:
+    ssrf_probes > 0 (logged, the URL is NEVER fetched).
+  traversal (T1083 File & Directory Discovery / T1190 -- path traversal / LFI)
+    Signature: file/path parameters with ../ sequences (raw, encoded %2e%2e /
+    ..%2f, or mixed slashes) reaching for /etc/passwd, boot.ini, win.ini. Lab
+    metric: traversal_probes > 0 (logged, never opened).
   portscan (T1595.001)
     Signature: one source opening connections to MANY ports in a short window.
     Lab metric: widest_port_scan high; port_scan_detected event.
@@ -672,11 +830,28 @@ and confirm your tooling caught it.
      /.git, /.env, /wp-admin, /phpmyadmin, /server-status.
 
 3. INJECTION PROBES
-   - WAF / log pattern match for SQLi/XSS/traversal signatures in query and body.
+   - WAF / log pattern match for SQLi/XSS signatures in query and body.
    - High signal when payloads hit params that normally take plain values.
    - Controls: parameterised queries, input validation, WAF, output encoding.
 
-4. SCANNING / RECON
+4. SSRF PROBES (server-side request forgery)
+   - Alert on URL-valued params whose value resolves to link-local/loopback/
+     private space -- above all 169.254.169.254 and metadata.google.internal
+     (cloud instance metadata; SSRF here leaks IAM credentials -> T1552.005).
+   - Watch outbound egress FROM the web tier to the metadata IP; a web server
+     should never call 169.254.169.254 for a user-supplied URL.
+   - Decode before matching, and match schemes too (file://, gopher://, dict://).
+   - Controls: allowlist outbound hosts, block link-local egress, IMDSv2
+     (hop-limit + session tokens), and never fetch user-supplied URLs raw.
+
+5. PATH TRAVERSAL / LFI
+   - File/path params carrying ../ (also ..%2f, %2e%2e, ....//, ..\) or absolute
+     sensitive paths (/etc/passwd, boot.ini). Normalise/decode ONCE then match;
+     watch for double-encoding (%252e) that a single decode leaves as %2e.
+   - Controls: canonicalise then confine to a base dir, reject .. after decode,
+     serve files by ID not by path.
+
+6. SCANNING / RECON
    - Connections to many closed ports from one source (SYN to no listener),
      high connection-attempt fan-out. NetFlow: one src -> many dst ports.
    - Controls: rate limit, tarpit, alert, and reduce exposed surface.
@@ -697,6 +872,8 @@ TABLETOP MAPPING (lab event -> what the detector should see)
    auth_failure_threshold_exceeded -> brute-force / credential-stuffing alert
    not_found_threshold_exceeded    -> enumeration / dir-busting alert
    injection_probes (final)        -> WAF/log payload matches
+   ssrf_probe_threshold_exceeded   -> SSRF alert + egress-to-metadata detection
+   path_traversal_threshold_exceeded -> traversal/LFI alert on file params
    port_scan_detected              -> scan detection on the port sensors
 """
 
@@ -741,6 +918,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="permit private lab network; public addresses refused")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"concurrent workers (default {DEFAULT_WORKERS}, max {MAX_WORKERS})")
+    parser.add_argument("--duration", type=int, default=DEFAULT_DURATION,
+                        help=f"seconds to keep attack mode active (default {DEFAULT_DURATION}, max {MAX_DURATION})")
     parser.add_argument("--rounds", type=int, default=3,
                         help="how many times to repeat the wordlist/cred list (default 3)")
     parser.add_argument("--alert-401", type=int, default=DEFAULT_ALERT_401)
@@ -756,11 +935,12 @@ def main(argv: list[str] | None = None) -> None:
         serve(lab, args.port, run_id, args.alert_401, args.alert_404, args.alert_scan,
               bind_host=args.bind, allow_lan=args.allow_lan)
     elif args.mode == "attack":
-        attack(lab, args.port, run_id, args.attack, args.workers, args.rounds,
+        attack(lab, args.port, run_id, args.attack, args.workers, args.rounds, args.duration,
                target_host=args.target, allow_lan=args.allow_lan)
     elif args.mode == "run":
         run(lab, args.port, run_id, args.attack, args.workers, args.rounds,
-            args.alert_401, args.alert_404, args.alert_scan, show_banner=args.announce)
+            args.alert_401, args.alert_404, args.alert_scan,
+            duration=args.duration, show_banner=args.announce)
     elif args.mode == "report":
         report(lab)
     elif args.mode == "detect":

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CyberSecurity_Lab — Blue-Team Detection Training · SpencerLab</title>
+  <meta name="description" content="Safe, self-contained simulations that reproduce the observable traces of common attacks so defenders can practise detecting them with Sysmon, EDR, and Wireshark." />
+  <!-- CSP-safe: external stylesheet only, no inline styles/scripts, no CDN. -->
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <span class="brand">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 2 4 5v6c0 5 3.4 8.3 8 11 4.6-2.7 8-6 8-11V5l-8-3Z" stroke="#34d399" stroke-width="1.6" fill="rgba(52,211,153,0.08)"/>
+          <path d="m8.5 12 2.4 2.4L15.8 9.6" stroke="#38bdf8" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        SpencerLab
+      </span>
+      <nav>
+        <a href="/">Home</a>
+        <a href="#labs">Labs</a>
+        <a href="#run">Run it</a>
+        <a href="https://github.com/spencerawlson/CyberSecurity_Lab">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero no-border">
+      <div class="wrap">
+        <span class="eyebrow">Blue-team detection training</span>
+        <h1>CyberSecurity_Lab</h1>
+        <p class="lead">
+          A collection of <strong>safe, self-contained simulations</strong> that reproduce the
+          <em>observable traces</em> of common attacks — so defenders can practise
+          <strong>detecting</strong> them with real tooling: Sysmon, EDR, Procmon, and
+          Wireshark/tcpdump. These are detection-training simulations, not attack tools.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/spencerawlson/CyberSecurity_Lab">View on GitHub →</a>
+          <a class="btn" href="#labs">The four labs</a>
+        </div>
+
+        <div class="safety">
+          <strong>Why it is safe.</strong> Every lab keeps traffic on <span class="mono">127.0.0.1</span>
+          by default (reaching another host needs an explicit <span class="mono">--allow-lan</span>,
+          which permits private/lab ranges only — public addresses are always refused); does
+          <strong>no source-IP spoofing</strong> and runs <strong>no real payloads</strong>; bounds
+          workers, duration, and response sizes; and writes an <span class="mono">events.jsonl</span>
+          answer key plus <span class="mono">report</span> and <span class="mono">detect</span> commands.
+          Run them only on systems and networks you own or are authorized to test.
+        </div>
+      </div>
+    </section>
+
+    <section id="labs">
+      <div class="wrap">
+        <h2>The four labs</h2>
+        <p class="sub">Each folder is self-contained — the lab script, its tests, and a README. Stdlib-only Python 3.9+.</p>
+        <div class="grid">
+
+          <article class="card">
+            <h3>Gift-Card IR <span class="port">TCP 8765</span></h3>
+            <p>A full intrusion story you can hunt end to end: a malicious lure, a payload, persistence, C2 beaconing, and staged exfiltration.</p>
+            <ul>
+              <li>Lure → payload → <strong>persistence</strong> → C2 beacon → exfil</li>
+              <li>Persistence writes simulated Run-key + scheduled-task artifacts (never applied)</li>
+              <li>Optional real local host telemetry to hunt (opt-in)</li>
+            </ul>
+            <div class="tags">
+              <span class="tag">T1036</span><span class="tag">T1204</span>
+              <span class="tag new">T1547.001</span><span class="tag new">T1053.005</span>
+              <span class="tag">T1071</span><span class="tag">T1041</span>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3>DDoS <span class="port">TCP 8768</span></h3>
+            <p>Volumetric and slow-rate denial of service, plus an HTTP/2 rapid-reset vector — each with a different detection signature to learn.</p>
+            <ul>
+              <li>volumetric · cachebust · connflood · bodyflood</li>
+              <li>slowloris · rudy · slowread</li>
+              <li><strong>rapidreset</strong> — HTTP/2 rapid reset (CVE-2023-44487)</li>
+            </ul>
+            <div class="tags">
+              <span class="tag">T1498</span><span class="tag">T1499</span>
+              <span class="tag new">CVE-2023-44487</span>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3>Amplification <span class="port">UDP 8769</span></h3>
+            <p>Why reflection/amplification works — a tiny query provokes a large response. Measure the factor safely (no spoofing, so it returns to you).</p>
+            <ul>
+              <li>Protocol profiles: <strong>DNS · NTP · SSDP · memcached</strong></li>
+              <li>Each pairs a query signature with a realistic factor + source port</li>
+            </ul>
+            <div class="tags">
+              <span class="tag">T1498.002</span>
+              <span class="tag new">NTP monlist</span><span class="tag new">SSDP</span>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3>Web-Attack <span class="port">TCP 8770</span></h3>
+            <p>The traces web attacks leave in access logs and connection telemetry. The victim only logs what it receives — payloads are never executed or fetched.</p>
+            <ul>
+              <li>credstuff · enum · inject · portscan</li>
+              <li><strong>ssrf</strong> — cloud metadata / internal targets (logged, never fetched)</li>
+              <li><strong>traversal</strong> — encoded path-traversal variants</li>
+            </ul>
+            <div class="tags">
+              <span class="tag">T1110</span><span class="tag">T1595</span><span class="tag">T1190</span>
+              <span class="tag new">T1083</span><span class="tag new">T1552.005</span>
+            </div>
+          </article>
+
+        </div>
+      </div>
+    </section>
+
+    <section id="run">
+      <div class="wrap">
+        <h2>Run it</h2>
+        <p class="sub">Every lab follows the same <span class="mono">serve → attack → run → report → detect → reset</span> pattern.</p>
+        <pre><span class="c"># Requires Python 3.9+ (standard library only for the core labs)</span>
+cd gift_card_lab
+py gift_card_lab.py run --announce --auto-serve   <span class="c"># play out a scenario</span>
+py gift_card_lab.py report                         <span class="c"># the answer key (timeline + IOCs)</span>
+py gift_card_lab.py detect                         <span class="c"># what to hunt for</span>
+py gift_card_lab.py reset                          <span class="c"># clean up</span></pre>
+
+        <div class="steps">
+          <div class="step">
+            <div class="n">01</div>
+            <h4>Run</h4>
+            <p>Launch a scenario on loopback while your detection tooling is active.</p>
+          </div>
+          <div class="step">
+            <div class="n">02</div>
+            <h4>Capture</h4>
+            <p>Watch it with Sysmon, EDR, Procmon, or a Wireshark/tcpdump capture.</p>
+          </div>
+          <div class="step">
+            <div class="n">03</div>
+            <h4>Compare</h4>
+            <p>Check what your tools caught against the <span class="mono">report</span> answer key.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="manual" class="no-border">
+      <div class="wrap">
+        <h2>The operator’s manual</h2>
+        <p class="sub">The full guide to running every lab with Sysmon, EDR, Procmon, and packet capture — properly, efficiently, and ethically.</p>
+        <p>
+          The repository ships a detection-lab manual (Markdown + PDF) covering tool setup, the
+          efficient run → capture → compare workflow, per-lab playbooks with ready-to-paste
+          queries and filters, and the rules of engagement.
+          <a href="https://github.com/spencerawlson/CyberSecurity_Lab/blob/main/docs/DETECTION_LAB_MANUAL.md">Read the manual →</a>
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span>© SpencerLab · CyberSecurity_Lab</span>
+      <span>·</span>
+      <a href="https://github.com/spencerawlson/CyberSecurity_Lab">github.com/spencerawlson/CyberSecurity_Lab</a>
+      <span>·</span>
+      <span>For authorized detection training only.</span>
+    </div>
+  </footer>
+</body>
+</html>

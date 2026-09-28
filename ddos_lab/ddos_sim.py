@@ -39,6 +39,7 @@ import json
 import os
 import shutil
 import socket
+import struct
 import sys
 import threading
 import time
@@ -58,9 +59,10 @@ HOST = "127.0.0.1"  # loopback only; see assert_loopback()
 MAX_WORKERS = 256
 MAX_DURATION = 300  # seconds
 DEFAULT_WORKERS = 50
-DEFAULT_DURATION = 10
+DEFAULT_DURATION = 60
 DEFAULT_ALERT_RPS = 100  # models the point an IDS/rate monitor would fire
 DEFAULT_ALERT_CONNS = 100
+DEFAULT_ALERT_RESETS = 50  # aborted connections that fire the rapid-reset alert
 
 MAX_BODY_BYTES = 64 * 1024  # reject oversized posts to the victim
 SOURCE_CAP = 200_000  # bound the unique-source set so memory can't run away
@@ -225,6 +227,7 @@ class Metrics:
         self.start = time.monotonic()
         self.total_requests = 0
         self.total_connections = 0  # separates connection-churn from keep-alive
+        self.total_aborted = 0  # conns torn down before a request completed (rapid reset)
         self.total_bytes_in = 0  # inbound POST bytes -- reveals body floods
         self.buckets: dict[int, int] = collections.defaultdict(int)  # sec -> count
         self.sources: set[str] = set()
@@ -248,6 +251,12 @@ class Metrics:
         with self.lock:
             if self.concurrent > 0:
                 self.concurrent -= 1
+
+    def on_abort(self) -> None:
+        """A connection was torn down before completing a request -- the trace a
+        rapid-reset flood leaves (streams opened then cancelled/RST)."""
+        with self.lock:
+            self.total_aborted += 1
 
     def on_request(
         self, source: str | None, path: str = "", handling_s: float = 0.0, bytes_in: int = 0
@@ -274,6 +283,7 @@ class Metrics:
                 "elapsed_s": round(time.monotonic() - self.start, 3),
                 "total_requests": self.total_requests,
                 "total_connections": self.total_connections,
+                "aborted_connections": self.total_aborted,
                 "total_bytes_in": self.total_bytes_in,
                 "unique_sources": len(self.sources),
                 "unique_urls": len(self.urls),
@@ -315,7 +325,9 @@ def make_handler(metrics: Metrics):
             try:
                 super().handle()
             except (ConnectionError, OSError):
-                pass
+                # Client vanished mid-exchange (reset / abrupt close) before the
+                # request completed -- the observable trace of a rapid-reset flood.
+                metrics.on_abort()
 
         def _source(self) -> str:
             return self.headers.get("X-Sim-Source") or self.client_address[0]
@@ -385,7 +397,7 @@ def _monitor(
     alert_conns: int,
 ) -> None:
     """Once a second, record the just-finished window and fire mock alerts."""
-    state = {"rps_alerted": False, "conn_alerted": False}
+    state = {"rps_alerted": False, "conn_alerted": False, "reset_alerted": False}
     while not stop.wait(1.0):
         with metrics.lock:
             sec = metrics._sec() - 1  # the most recent *complete* second
@@ -393,9 +405,17 @@ def _monitor(
             if rps > metrics.peak_rps:
                 metrics.peak_rps = rps
             concurrent = metrics.concurrent
+            aborted = metrics.total_aborted
         if rps > 0 or concurrent > 0:
             write_event(
                 lab, run_id, "traffic_window", second=sec, rps=rps, concurrent=concurrent
+            )
+        if aborted >= DEFAULT_ALERT_RESETS and not state["reset_alerted"]:
+            state["reset_alerted"] = True
+            write_event(
+                lab, run_id, "reset_flood_threshold_exceeded", aborted_connections=aborted,
+                threshold=DEFAULT_ALERT_RESETS,
+                note="an HTTP/2 rapid-reset (CVE-2023-44487) alert would fire here",
             )
         if rps >= alert_rps and not state["rps_alerted"]:
             state["rps_alerted"] = True
@@ -586,6 +606,51 @@ def _cachebust_worker(host: str, port: int, deadline: float, source: str) -> dic
     return {"sent": sent, "errors": errors}
 
 
+def _rapidreset_worker(host: str, port: int, deadline: float, source: str) -> dict:
+    """HTTP/2 rapid reset (CVE-2023-44487), modelled over HTTP/1.1.
+
+    A real rapid-reset flood opens a stream (HEADERS) and immediately cancels it
+    (RST_STREAM), over and over on one connection, so the server does the work of
+    creating and tearing down streams far faster than it can complete any. We
+    can't speak HTTP/2 to the stdlib victim, so we reproduce the *trace*: open a
+    connection, fire a burst of request "streams" for a large body, then abort
+    without reading a single response. The victim sees connections churn with
+    requests initiated but almost none completed -- aborted_connections climbs.
+    """
+    streams = resets = errors = 0
+    burst = 5
+    while time.monotonic() < deadline:
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+            # Best-effort: make close() send a TCP RST rather than a clean FIN,
+            # mirroring RST_STREAM. The SO_LINGER struct layout differs by OS, so
+            # this is wrapped -- if it's rejected we simply fall back to a close,
+            # which still aborts the in-flight response the same way.
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+            except OSError:
+                pass
+            req = (b"GET /download?kb=512 HTTP/1.1\r\n"
+                   + f"Host: {host}\r\n".encode()
+                   + f"X-Sim-Source: {source}\r\n".encode()
+                   + b"Connection: keep-alive\r\n\r\n")
+            for _ in range(burst):
+                sock.sendall(req)  # open a stream ...
+                streams += 1
+            sock.close()           # ... and cancel it: never read the response
+            resets += 1
+        except OSError:
+            errors += 1
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return {"streams": streams, "resets": resets, "errors": errors}
+
+
 def _connflood_worker(host: str, port: int, deadline: float, source: str) -> dict:
     """Open a fresh TCP connection per request and close it immediately --
     connection churn that exhausts the accept queue / ephemeral ports."""
@@ -638,6 +703,7 @@ ATTACKS = {
     "cachebust": _cachebust_worker,
     "connflood": _connflood_worker,
     "bodyflood": _bodyflood_worker,
+    "rapidreset": _rapidreset_worker,
 }
 
 
@@ -734,6 +800,7 @@ def run(
     print("\nPeak observed at the victim:")
     print(f"  total requests   : {final['total_requests']}")
     print(f"  total connections: {final['total_connections']}")
+    print(f"  aborted conns    : {final['aborted_connections']}")
     print(f"  inbound bytes    : {final['total_bytes_in']}")
     print(f"  peak requests/sec: {final['peak_rps']}")
     print(f"  peak concurrent  : {final['peak_concurrent']}")
@@ -776,7 +843,8 @@ def report(lab: Path) -> None:
         extra = ""
         if e["event"] == "traffic_window":
             extra = f"  rps={e.get('rps')} concurrent={e.get('concurrent')}"
-        elif e["event"] in ("rate_threshold_exceeded", "connection_threshold_exceeded"):
+        elif e["event"] in ("rate_threshold_exceeded", "connection_threshold_exceeded",
+                             "reset_flood_threshold_exceeded"):
             extra = f"  !! {e.get('note', '')}"
         elif e["event"] == "flood_started":
             extra = f"  attack={e.get('attack')} workers={e.get('workers')}"
@@ -800,6 +868,7 @@ def report(lab: Path) -> None:
     if final:
         print(f"  total requests served : {final.get('total_requests', 0)}")
         print(f"  total connections     : {final.get('total_connections', 0)}")
+        print(f"  aborted connections   : {final.get('aborted_connections', 0)}")
         print(f"  inbound bytes         : {final.get('total_bytes_in', 0)}")
         print(f"  unique sources        : {final.get('unique_sources', 0)}")
         print(f"  unique URLs           : {final.get('unique_urls', 0)}")
@@ -826,6 +895,10 @@ caught it. The metric that gives each one away differs -- that is the lesson:
                           accept-queue / ephemeral-port exhaustion.
   bodyflood               inbound BYTES spike while request count is modest --
                           bandwidth / read-time exhaustion.
+  rapidreset (T1499.002;  requests/streams INITIATED far exceed completed ones;
+   CVE-2023-44487)        connections open then abort/RST almost immediately.
+                          Lab metric: aborted_connections climbs while
+                          total_requests stays low (work done, nothing served).
   slowloris (T1499.001)   concurrency climbs and holds; requests DON'T complete
                           (held request *headers*).
   rudy                    like slowloris but holds a POST *body* open (tiny
@@ -839,7 +912,8 @@ Which lab metric exposes each (see `report` / victim_metrics_final):
   total_connections .... connection churn (connflood: ~= requests)
   total_bytes_in ....... body floods (bodyflood: large)
   peak_concurrent ...... slow-rate holds (slowloris/rudy/slowread: high)
-  total_requests ....... completed work (slow-rate: near zero)
+  aborted_connections .. rapid reset (rapidreset: high; requests never complete)
+  total_requests ....... completed work (slow-rate & rapidreset: near zero)
 
 1. RATE / VOLUME ANOMALIES
    - Baseline your normal requests/sec, connections/sec, and bandwidth, then
@@ -884,6 +958,10 @@ Which lab metric exposes each (see `report` / victim_metrics_final):
    - slow-rate (slowloris/rudy/slowread): filter `tcp.flags.syn==1` for opens,
      then look for connections that stay ESTABLISHED with little/no data and
      never cleanly FIN -- concurrency holds while completions stay flat.
+   - rapidreset: the opposite shape -- a storm of short connections that abort
+     almost immediately (`tcp.flags.reset==1` spikes; over real HTTP/2 you'd see
+     HEADERS quickly followed by RST_STREAM). Requests initiated per connection
+     dwarf completed responses.
 
 MITIGATIONS worth demoing alongside the hunt:
    - Rate limiting / connection limits per source (nginx limit_req/limit_conn,
@@ -900,6 +978,7 @@ TABLETOP MAPPING (lab event -> what the detector should see)
    traffic_window (high conns)    -> connection-table growth (slowloris)
    rate_threshold_exceeded        -> volumetric/HTTP-flood alert fires
    connection_threshold_exceeded  -> connection-exhaustion alert fires
+   reset_flood_threshold_exceeded -> HTTP/2 rapid-reset (CVE-2023-44487) alert
    victim_metrics_final           -> post-incident summary (peak rps, p95, etc.)
 """
 
@@ -980,7 +1059,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--attack", choices=list(ATTACKS), default="volumetric",
         help="attack style to simulate (flood/run): volumetric, cachebust, "
-             "connflood, bodyflood, slowloris, rudy, slowread",
+             "connflood, bodyflood, rapidreset, slowloris, rudy, slowread",
     )
     parser.add_argument(
         "--workers", type=int, default=DEFAULT_WORKERS,

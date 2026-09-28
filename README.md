@@ -14,6 +14,14 @@ These are **detection-training simulations, not attack tools.** Every lab:
 - writes an `events.jsonl` **answer key** and ships `report` (timeline + IOCs) and
   `detect` (hunting guidance) commands.
 
+> **Optional real telemetry (gift-card lab only).** Its `--with-monitoring` flag
+> additionally starts real *local* host-telemetry collectors — keystrokes,
+> clipboard, periodic screenshots, and the active-window/process list — so you
+> can generate genuine endpoint telemetry to hunt in. It is **off by default**,
+> prints/saves only locally, sends nothing off the box, and is separate from the
+> simulated payload (which only writes fixed `TEST_*` events). See
+> [gift_card_lab/README.md](gift_card_lab/README.md#optional-real-host-monitoring).
+
 > Run these only on systems and networks you own or are explicitly authorized to
 > test. See the manual's *Rules of engagement* before you start.
 
@@ -21,13 +29,15 @@ These are **detection-training simulations, not attack tools.** Every lab:
 
 | Lab | Folder | Protocol / port | Simulates | MITRE |
 | --- | --- | --- | --- | --- |
-| Gift-Card IR | [gift_card_lab/](gift_card_lab/) | TCP/HTTP **8765** | Malicious lure → payload → C2 beacon → exfil | T1036, T1204, T1071, T1041 |
-| DDoS | [ddos_lab/](ddos_lab/) | TCP/HTTP **8768** | Volumetric & slow-rate denial of service | T1498, T1499 |
-| Amplification | [amplification_lab/](amplification_lab/) | **UDP 8769** | UDP reflection / amplification factor | T1498.002 |
-| Web-Attack | [web_attack_lab/](web_attack_lab/) | TCP/HTTP **8770** | Credential stuffing, enumeration, injection probes, port scan | T1110, T1595, T1190 |
+| Gift-Card IR | [gift_card_lab/](gift_card_lab/) | TCP/HTTP **8765** | Lure → payload → **persistence** → C2 beacon → exfil | T1036, T1204, T1547.001, T1053.005, T1071, T1041 |
+| DDoS | [ddos_lab/](ddos_lab/) | TCP/HTTP **8768** | Volumetric, slow-rate & **HTTP/2 rapid reset** (CVE-2023-44487) | T1498, T1499 |
+| Amplification | [amplification_lab/](amplification_lab/) | **UDP 8769** | UDP reflection / amplification — **DNS/NTP/SSDP/memcached** profiles | T1498.002 |
+| Web-Attack | [web_attack_lab/](web_attack_lab/) | TCP/HTTP **8770** | Credential stuffing, enumeration, injection, **SSRF**, **path traversal**, port scan | T1110, T1595, T1190, T1083, T1552.005 |
 
-Each folder is self-contained: the lab script, its tests, a `README.md`, and a
-`RUN-TRAINING-SIMULATION.cmd` double-click launcher.
+Each folder is self-contained: the lab script, its tests, and a `README.md`. The
+gift-card and DDoS labs also ship a `RUN-TRAINING-SIMULATION.cmd` double-click
+launcher (plus a `make-shortcut.ps1`); run the amplification and web-attack labs
+from a terminal — see each lab's `README.md`.
 
 ## The operator's manual
 
@@ -40,7 +50,8 @@ rules of engagement.
 
 ## Quick start
 
-Requires **Python 3.9+** (standard library only — nothing to install).
+Requires **Python 3.9+** (standard library only — nothing to install for the core
+labs; the gift-card lab's optional `--with-monitoring` needs `requirements.txt`).
 
 ```powershell
 cd gift_card_lab
@@ -73,11 +84,18 @@ CyberSecurity_Lab/
 ├─ docs/
 │  ├─ DETECTION_LAB_MANUAL.md
 │  └─ DETECTION_LAB_MANUAL.pdf
-├─ gift_card_lab/                lure → payload → C2 beacon → exfil
-├─ ddos_lab/                     volumetric & slow-rate DoS
-├─ amplification_lab/            UDP reflection / amplification
-└─ web_attack_lab/               credstuff / enum / inject / portscan
+├─ site/                         static page for spencerlab.tech/labs/ (deploy notes inside)
+├─ gift_card_lab/                lure → payload → persistence → C2 beacon → exfil
+├─ ddos_lab/                     volumetric, slow-rate & HTTP/2 rapid reset
+├─ amplification_lab/            UDP reflection / amplification (DNS/NTP/SSDP/memcached)
+└─ web_attack_lab/               credstuff / enum / inject / ssrf / traversal / portscan
 ```
+
+## Published site
+
+A static write-up of these labs is published at
+**[spencerlab.tech/labs](https://spencerlab.tech/labs/)**. The page source lives in
+[`site/`](site/) — see [site/README.md](site/README.md) for the (CSP-aware) deploy steps.
 
 ---
 
