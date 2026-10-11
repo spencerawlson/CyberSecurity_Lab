@@ -10,6 +10,7 @@ class Service:
     product: str = ""
     version: str = ""
     extra_info: str = ""
+    exploits: list = field(default_factory=list)
 
     def dictionary(self):
         return asdict(self)
