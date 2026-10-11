@@ -89,19 +89,17 @@ def nmap_scan(target, ports=None):
 
     result = run_command(command)
 
-    if result.returncode != 0:
+    try:
+        if result.returncode != 0:
+            raise ScannerError(
+                result.stderr.strip()
+                or "Nmap failed."
+            )
+
+        return parse_nmap_xml(xml_path)
+
+    finally:
         xml_path.unlink(missing_ok=True)
-
-        raise ScannerError(
-            result.stderr.strip()
-            or "Nmap failed."
-        )
-
-    parsed = parse_nmap_xml(xml_path)
-
-    xml_path.unlink(missing_ok=True)
-
-    return parsed
 
 
 def parse_nmap_xml(filename):
